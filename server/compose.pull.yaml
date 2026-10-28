@@ -1,6 +1,6 @@
 services:
   server:
-    image: ghcr.io/sohaibqasem/osdu-lite:latest
+    image: ghcr.io/mehmetkadriumay/osdu-lite:latest
     container_name: osdu-well360-local
     ports:
       - "8089:8089"

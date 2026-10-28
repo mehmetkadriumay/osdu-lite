@@ -2,8 +2,8 @@
 
 An in-memory emulator for the OSDU service APIs, for development, demos, and CI.
 
-[![CI](https://github.com/sohaibqasem/osdu-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/sohaibqasem/osdu-lite/actions/workflows/ci.yml)
-[![Container image](https://github.com/sohaibqasem/osdu-lite/actions/workflows/publish-docker.yml/badge.svg)](https://github.com/sohaibqasem/osdu-lite/actions/workflows/publish-docker.yml)
+[![CI](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/ci.yml)
+[![Container image](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/publish-docker.yml/badge.svg)](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/publish-docker.yml)
 
 A small Python HTTP server that emulates selected contracts from Storage,
 Search, Dataset, File, Workflow, Legal, Schema, Entitlements, CRS, Unit, Indexer,
@@ -25,11 +25,11 @@ against `os-core-common`. See [Releases and changelog](CHANGELOG.md).
 ### Pull the image (no clone, no build)
 
 ```bash
-docker run --rm -d --name osdu-well360 -p 8089:8089 ghcr.io/sohaibqasem/osdu-lite
+docker run --rm -d --name osdu-well360 -p 8089:8089 ghcr.io/mehmetkadriumay/osdu-lite:latest
 ```
 
-`latest` tracks `main`; every `v*` tag also publishes its own image, e.g.
-`ghcr.io/sohaibqasem/osdu-lite:v0.7.0-beta.1`. Both `amd64` and `arm64`.
+`latest` tracks `main`; pushing a `v*` tag to `mehmetkadriumay/osdu-lite`
+also publishes matching versioned images. Both `amd64` and `arm64` are supported.
 
 ### From source
 
