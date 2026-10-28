@@ -22,22 +22,88 @@ against `os-core-common`. See [Releases and changelog](CHANGELOG.md).
 
 ## Quickstart
 
-### Pull the image (no clone, no build)
+### Run with WSL containers (no Docker Desktop)
+
+Use the container CLI **`wslc.exe`**, included with WSL 2.9.3 or later.
+There is no Docker engine to install. See Microsoft's
+[WSL containers guide](https://learn.microsoft.com/en-us/windows/wsl/tutorials/wsl-containers).
+
+First, update and verify WSL from **Windows PowerShell**:
+
+```powershell
+wsl --update
+wsl --version
+wslc.exe version
+```
+
+Then open your **WSL terminal** (for example, Ubuntu). The commands below use
+Windows interoperability to invoke `wslc.exe` from the Linux shell; keep the
+`.exe` suffix. No repository clone or local Python installation is needed to
+start the published image:
 
 ```bash
-docker run --rm -d --name osdu-well360 -p 8089:8089 ghcr.io/mehmetkadriumay/osdu-lite:latest
+wslc.exe pull ghcr.io/mehmetkadriumay/osdu-lite:latest
+wslc.exe run --rm -d --name osdu-well360 -p 8089:8089 ghcr.io/mehmetkadriumay/osdu-lite:latest
 ```
+
+The API is available at **http://localhost:8089**, with 15 sample records
+preloaded. From WSL, wait for startup and check health:
+
+```bash
+curl --fail --retry 20 --retry-connrefused --retry-delay 1 http://localhost:8089/health
+```
+
+Manage the container from the same terminal:
+
+```bash
+wslc.exe container list
+wslc.exe logs osdu-well360
+wslc.exe stop osdu-well360
+```
+
+`--rm` removes the container after it stops. All data is in memory; starting a
+new container reloads the sample and discards previous changes. If the name or
+port is already in use, stop your previous instance before starting another.
 
 `latest` tracks `main`; pushing a `v*` tag to `mehmetkadriumay/osdu-lite`
 also publishes matching versioned images. Both `amd64` and `arm64` are supported.
 
-### From source
+### Build from source with wslc.exe
 
-Prereqs: CPython 3.11 or 3.12, Docker + Compose (for the container path only). Java 17+ and
-Maven are needed for the demo client.
+From the repository root in your **WSL terminal**, build the existing
+`server/Dockerfile` without Docker Desktop. Convert the build-context path for
+the Windows executable:
+
+```bash
+wslc.exe build -t osdu-lite:local "$(wslpath -w "$PWD/server")"
+wslc.exe run --rm -d --name osdu-well360 -p 8089:8089 osdu-lite:local
+```
+
+Stop any previously started `osdu-well360` container before running the local
+image. The image includes Python, pyproj and the bundled offline PROJ resources.
+Java 17+ and Maven are only needed if you run the reference Java client.
+
+### Test a running WSL container
+
+From the repository root in WSL, run the HTTP smoke checks. They use Bash,
+`curl` and Python 3's standard library; they do not require Docker or a local
+installation of pyproj:
+
+```bash
+bash server/smoke-test.sh
+bash server/reference-smoke-test.sh
+python3 server/community-smoke-test.py
+```
+
+These target `http://localhost:8089` by default. Set `OSDU_BASE_URL` if you
+published a different host port. Use `make java` to run the reference Java
+client against the same running server.
+
+### Native Python alternative (no container runtime)
 
 For native development and tests, install the pinned **binary-only** runtime
-dependencies first (including pyproj 3.7.2 and certifi). Use an isolated environment:
+dependencies first (including pyproj 3.7.2 and certifi). Use CPython 3.11 or
+3.12 and an isolated environment:
 
 ```bash
 python3 -m venv .venv
@@ -49,8 +115,14 @@ python server/server.py
 
 The hash manifest supports Windows x64 and Linux amd64/arm64 on Python 3.11/3.12;
 other platforms need separately reviewed wheel hashes. Missing native resources
-fail at startup; there is no stub fallback. Docker installs the same dependencies
-on the existing Python 3.12 Alpine base without a compiler.
+fail at startup; there is no stub fallback. The container build installs the same
+dependencies on the existing Python 3.12 Alpine base without a compiler.
+
+### Optional Docker/Compose alternative
+
+The existing Make start/stop/demo targets use Docker Compose, **not**
+`wslc.exe`. They remain available for users who choose Docker + Compose instead
+of the WSL-container commands above:
 
 ```bash
 make start        # build and start the emulator on :8089, 15 Well 360 records preloaded
@@ -390,8 +462,8 @@ grid downloads or writable-cache requirements. Local validation used pyproj 3.7.
 PROJ 9.5.1, EPSG v11.022. Run `bash server/reference-smoke-test.sh` against a running
 server for numerical HTTP assertions; `make smoke` includes it. CI builds Alpine
 for amd64 and arm64 and runs a real conversion probe under `--network none`.
-Those container probes require Docker; wheel availability alone does not establish
-that either image works.
+CI uses Docker for these checks; local WSL-container use does not require Docker
+Desktop. Wheel availability alone does not establish that either image works.
 
 ### Health
 
@@ -526,9 +598,12 @@ Start empty, then ingest one of each record type with plain `curl`, no POC
 helpers. This mirrors what a real client does against a deployment.
 
 ```bash
-# 1. start empty
-sed -i 's/PRELOAD_FULL_SAMPLE: "true"/PRELOAD_FULL_SAMPLE: "false"/' server/compose.yaml
-cd server && docker compose down && docker compose up -d --build && cd ..
+# 1. start empty with WSL containers
+# If the quickstart container is still running, stop it first:
+wslc.exe stop osdu-well360
+wslc.exe run --rm -d --name osdu-well360 -p 8089:8089 \
+  -e PRELOAD_FULL_SAMPLE=false ghcr.io/mehmetkadriumay/osdu-lite:latest
+curl --fail --retry 20 --retry-connrefused --retry-delay 1 http://localhost:8089/health
 
 export OSDU_BASE_URL=http://localhost:8089 OSDU_PARTITION=company-prod OSDU_TOKEN=demo-token
 export AUTH="Authorization: Bearer $OSDU_TOKEN"
@@ -574,7 +649,7 @@ that returns zero after about a second.
 ## Tests
 
 The test runner uses stdlib `unittest`, with pinned runtime dependencies installed;
-no Docker or live server is needed:
+no container runtime or live server is needed:
 
 ```bash
 make test
@@ -603,6 +678,8 @@ publishes the multi-arch container image to GHCR.
 
 | Symptom                              | Cause and fix                                                          |
 | ------------------------------------ | --------------------------------------------------------------------- |
+| `wslc.exe: command not found`        | Update WSL to 2.9.3 or later from PowerShell; ensure Windows interoperability and Windows PATH import are enabled in the WSL distribution. |
+| Container name or port already used | Use `wslc.exe container list` to identify your previous instance and `wslc.exe stop osdu-well360` to stop it, or choose another name and host port. |
 | 401                                  | use `Authorization: Bearer demo-token`                                 |
 | 400                                  | use `data-partition-id: company-prod`                                  |
 | 403                                  | token is not in the required entitlement; the demo token has all groups |
