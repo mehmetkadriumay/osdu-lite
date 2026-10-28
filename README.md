@@ -5,8 +5,8 @@ An in-memory emulator for the OSDU service APIs, for development, demos, and CI.
 [![CI](https://github.com/sohaibqasem/osdu-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/sohaibqasem/osdu-lite/actions/workflows/ci.yml)
 [![Container image](https://github.com/sohaibqasem/osdu-lite/actions/workflows/publish-docker.yml/badge.svg)](https://github.com/sohaibqasem/osdu-lite/actions/workflows/publish-docker.yml)
 
-A single-file Python HTTP server that serves the same contracts as Storage,
-Search, Dataset, File, Workflow, Legal, Schema, and Entitlements. An OSDU client
+A small Python HTTP server that emulates selected contracts from Storage,
+Search, Dataset, File, Workflow, Legal, Schema, Entitlements, CRS and Unit. An OSDU client
 built against a real deployment points at `http://localhost:8089` instead and
 runs unchanged. Think LocalStack for OSDU: no cloud, no OpenSearch, no OIDC.
 
@@ -31,12 +31,28 @@ docker run --rm -d --name osdu-well360 -p 8089:8089 ghcr.io/sohaibqasem/osdu-lit
 
 ### From source
 
-Prereqs: Python 3, Docker + Compose (for the container path only). Java 17+ and
+Prereqs: CPython 3.11 or 3.12, Docker + Compose (for the container path only). Java 17+ and
 Maven are needed for the demo client.
+
+For native development and tests, install the pinned **binary-only** runtime
+dependencies first (including pyproj 3.7.2 and certifi). Use an isolated environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate              # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install --only-binary=:all: --require-hashes -r server/requirements.txt
+python -m unittest discover -s server/tests -v
+python server/server.py
+```
+
+The hash manifest supports Windows x64 and Linux amd64/arm64 on Python 3.11/3.12;
+other platforms need separately reviewed wheel hashes. Missing native resources
+fail at startup; there is no stub fallback. Docker installs the same dependencies
+on the existing Python 3.12 Alpine base without a compiler.
 
 ```bash
 make start        # build and start the emulator on :8089, 15 Well 360 records preloaded
-make smoke        # health / entitlements / legal / kinds / search checks
+make smoke        # existing checks + CRS/Unit numerical assertions
 make java         # reference client (real os-core-common) against the emulator
 make stop
 ```
@@ -72,6 +88,9 @@ All in memory; every process restart returns to a clean state.
 | Legal        | v1   | tag CRUD, validate, batch retrieve, properties, query operators      |
 | Schema       | v1   | kind list, schema create/update/system                               |
 | Entitlements | v1/v2 | groups, members, membersCount, roles, appIds                       |
+| CRS Catalog  | v3 subset | four fixed horizontal CRS entries, detail and filtered queries |
+| CRS Converter | v3 subset | offline pyproj x/y conversion, ordered batches; z retained |
+| Unit         | v3 subset | 17 fixed units, six dimensions, scale/offset coefficients |
 
 Two behaviors matter for anyone writing code against it:
 
@@ -109,7 +128,7 @@ Record IDs are deterministic (`company-prod:master-data--Well:W-1001`).
 ## Repository layout
 
 ```text
-server/          the emulator (single-file server.py + Docker image)
+server/          the emulator (server.py, reference_services.py + Docker image)
   composition    compose.yaml (build) and compose.pull.yaml (image)
 examples/well360/
   client/        os-core-common Java consumer
@@ -120,8 +139,120 @@ examples/well360/
 
 ## Endpoint reference
 
-An OSDU client needs nothing beyond these routes. Full request/response shapes
-follow the OSDU OpenAPI specs.
+The supported routes are listed below. Reference-service compatibility decisions
+and limitations are explicit in the following section.
+
+### CRS and Unit: bounded community v3 subset
+
+This is **partial community-API emulation, not OSDU Standard v1.0 compliance,
+certification, or a full reference catalog**. Reviewed mutable OpenAPI v3.0.0
+sources (retrieved 2026-10-27), fingerprints, examples, and deliberate differences
+are frozen in `server/tests/fixtures/reference_contracts.json`. The bundled data
+and attribution are in `server/data/reference_catalog.json`; no records are
+added to Storage/Search, and reset/preload counts are unchanged.
+
+| Method | Path (also accepted without `/api`) |
+| --- | --- |
+| GET / POST | `/api/crs/catalog/v3/coordinate-reference-system` |
+| POST | `/api/crs/converter/v3/convert` |
+| GET | `/api/unit/v3/unit` |
+| GET | `/api/unit/v3/unit/symbol?namespaces=osdu-lite&symbol=ft%5BUS%5D` |
+| GET | `/api/unit/v3/unit/measurement?ancestry=Length` |
+| GET | `/api/unit/v3/measurement/list` |
+| GET / POST | `/api/unit/v3/conversion/scale` |
+
+All use the existing bearer token, partition, error envelope, CORS and correlation
+conventions. Separate **emulator-local** roles are `osdu-lite.crs.catalog.user`,
+`osdu-lite.crs.converter.user`, and `osdu-lite.unit.user` (seeded for the demo token).
+These names are not asserted to be official upstream entitlements.
+
+**Catalog.** EPSG:4326, 3857, 32638, 32639 only. POST supports exact string filters
+`codeSpace`, `code`, `id` (the data ID), `kind`, case-insensitive substring `name`
+(no wildcard interpretation), `includeDeprecated`, `offset`, `limit`,
+`returnAllFields`, and `returnedFields`. Filters combine with AND; results are
+ordered by numeric EPSG code, with totals before pagination and default limit all.
+Boolean/integer options accept their JSON types or strict string forms. Unknown
+filters/field paths fail with 400; `returnAllFields` overrides projection. The local
+default projection is `id`, `kind`, and `data.{ID,Name,Code,CodeSpace,Kind,PersistableReference}`;
+explicit projection uses nested record paths. The returned `query` is a diagnostic
+of local filtering, **not an executed Search query**.
+
+GET requires exactly one `recordId` with a terminating colon, e.g.
+`osdu:reference-data--CoordinateReferenceSystem:Geographic2D:EPSG::4326:`, or
+`dataId=Geographic2D:EPSG::4326` (no terminating colon), and returns full detail in
+`searchResults.results` plus `totalCount`. Unknown identifiers return 404.
+
+**Converter.** Pass the exact JSON-serialized `data.PersistableReference` strings
+returned by this catalog as `fromCRS`/`toCRS`, with `points: [{"x":10,"y":20,"z":123.45}]`.
+Only catalog-issued definitions are accepted, ignoring JSON whitespace/key order
+but checking all WKT and metadata. These local LBC references use bundled PROJ
+WKT2 and `ver=OSDU-Lite/pyproj-3.7.2`, not upstream PE WKT/versioning. Bare EPSG
+strings, record IDs, alternate/custom WKT, pipelines, bound/vertical/dynamic
+definitions and datum changes are unsupported. No definitions supplied by a caller
+are executed by PROJ.
+
+`always_xy=True`: longitude/latitude for geographic input; easting/northing for
+projected input. Only x/y is converted; successful z is retained numerically
+unchanged with **no vertical semantics, unit conversion or accuracy guarantee**.
+PROJ uses `allow_ballpark=False`, `only_best=True` and checked errors; there is no
+approximate or identity fallback. Identity requests for an allowed CRS still use
+PROJ and validate its domain. Actual successful operation descriptions are returned
+in `operationsApplied` (empty for an all-failed batch).
+
+Operating envelopes are deliberately conservative: 4326 longitude ±180°, latitude
+±90°; 3857 latitude ±85.0511287798066°; UTM 38N longitude [42,48]°, 39N [48,54]°,
+both latitude [0,84]°. Source and target domains are checked; projected coordinates
+must round-trip (1e-6 m absolute / 1e-12 relative tolerance) to reject wrapping.
+Inverse boundary noise allows 1e-10°; coordinates are never clamped.
+
+Generated public schemas declare coordinates/counts as strings despite numeric
+request examples. This emulator accepts finite JSON numbers or strict decimal/
+exponent strings, and **returns string x/y/z and string `successCount`**. Malformed
+points reject the entire request with 400. A well-formed out-of-domain point becomes
+`{"x":"NaN","y":"NaN","z":"NaN"}` without changing order/batch length. This failure
+encoding is an **explicit emulator policy, not verified upstream serialization**.
+Booleans, null, NaN, Infinity, overflow and arbitrary numeric coercion are rejected.
+Batches require 1–1,000 points; JSON bodies on these new routes are capped at 1 MiB
+(413 above that); strict parsing is confined to new routes.
+
+**Units.** The namespace is **`osdu-lite` only**: upstream namespace and ancestry
+identity could not be established, so this curated SI-based catalog is not passed
+off as the official catalog. Dimension identities and supported symbols:
+
+| Local ancestry | Symbols |
+| --- | --- |
+| Length | `m`, `km`, `ft`, `ft[US]` |
+| Time | `s`, `ms` |
+| PlaneAngle | `dega`, `rad` |
+| Pressure | `Pa`, `kPa`, `bar`, `psi` |
+| AbsoluteTemperature | `K`, `degC`, `degF` |
+| Speed | `m/s`, `ft/s` |
+
+International foot is 0.3048 m; US survey foot is 1200/3937 m. Absolute temperature
+has affine offsets; temperature differences and arbitrary compound expressions are
+not supported. Dimensions must match. GET scale requires `namespaces`, `fromSymbol`,
+`toSymbol`. POST takes exactly one of `fromUnit`/`fromUnitPersistableReference`
+and exactly one of `toUnit`/`toUnitPersistableReference`. Objects must match catalog
+`essence`; string references are the corresponding `essenceJson`. The source-backed
+wire field is `baseMeasurement`, not the generated interface's `baseMeasurementEssence`.
+Caller-supplied conflicting coefficients are rejected; there is no general ABCD
+or converted-value/batch endpoint.
+
+The response is `fromUnit`, `toUnit`, `scaleOffset` using **`y = scale * (x - offset)`**.
+For example `degF` → `degC` yields scale 5/9 and offset 32; applying to 212 gives 100.
+Unknown units/namespaces return 404; malformed definitions/incompatible dimensions
+return 400. Unit/measurement lists default to offset 0, limit 100; limit -1 returns
+the whole subset; limit 0 is an empty page. Duplicate, missing and blank parameters
+are rejected, not silently defaulted.
+
+**Offline runtime and checks.** pyproj uses its wheel's bundled PROJ database with
+`PROJ_NETWORK=OFF` and the network API disabled. There are no runtime HTTP calls,
+grid downloads or writable-cache requirements. Local validation used pyproj 3.7.2,
+PROJ 9.5.1, EPSG v11.022. Run `bash server/reference-smoke-test.sh` against a running
+server for numerical HTTP assertions; `make smoke` includes it. CI builds Alpine
+for amd64 and arm64 and runs a real conversion probe under `--network none`.
+Those container probes require Docker; wheel availability alone does not establish
+that either image works.
 
 ### Health
 

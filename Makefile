@@ -4,7 +4,7 @@ SHELL := /usr/bin/env bash
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-test: ## Run the server unit tests (stdlib unittest, no Docker needed)
+test: ## Run unittest (install server/requirements.txt first; no Docker needed)
 	cd server && python3 -m unittest discover -s tests -v
 
 start: ## Build and start the local OSDU-compatible façade (Docker)
@@ -15,6 +15,7 @@ stop: ## Stop the local façade
 
 smoke: ## Run health + smoke checks against the local façade
 	cd server && ./smoke-test.sh
+	cd server && bash ./reference-smoke-test.sh
 
 pull-up: ## Pull the published image from GHCR and start it
 	cd server && docker compose -f compose.pull.yaml up -d
@@ -24,6 +25,7 @@ pull-down: ## Stop the image-based façade
 
 pull-smoke: ## Health + smoke checks against the pulled image
 	cd server && ./smoke-test.sh
+	cd server && bash ./reference-smoke-test.sh
 
 java: ## Run the real os-core-common Java consumer (façade must be started)
 	cd examples/well360/client && ./run.sh

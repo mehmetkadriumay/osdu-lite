@@ -15,9 +15,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install pinned binary runtime dependencies
+        run: |
+          python -m pip install --only-binary=:all: --require-hashes -r server/requirements.txt
+
       - name: Syntax checks
         run: |
-          python -m py_compile server/server.py
+          python -m py_compile server/server.py server/reference_services.py server/tests/test_reference_services.py
           for f in demo-all.sh examples/well360/demo/*.sh server/*.sh examples/well360/client/*.sh; do
             bash -n "$f" || exit 1
           done
@@ -29,6 +33,7 @@ jobs:
         run: |
           python3 server/server.py &
           SERVER_PID=$!
+          trap 'kill "$SERVER_PID" || true' EXIT
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:8089/health >/dev/null 2>&1; then
               break
@@ -36,7 +41,43 @@ jobs:
             sleep 1
           done
           server/smoke-test.sh
-          kill $SERVER_PID || true
+          bash server/reference-smoke-test.sh
+
+  reference-container:
+    name: Offline reference services (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: osdu-lite-reference:test
+      - name: Actual offline conversion with bundled PROJ resources
+        run: |
+          docker run --rm --network none --platform "${{ matrix.platform }}" osdu-lite-reference:test python -c '
+          import json, math, os, pyproj
+          import reference_services as r
+          assert os.environ["PROJ_NETWORK"] == "OFF"
+          assert not pyproj.network.is_network_enabled()
+          def ref(code):
+              return r.catalog_query({"code": code})["searchResults"]["results"][0]["data"]["PersistableReference"]
+          result = r.convert_points({"fromCRS": ref("4326"), "toCRS": ref("3857"),
+                                    "points": [{"x": 10, "y": 20, "z": 123.45}]})
+          p = result["points"][0]
+          assert result["successCount"] == "1", result
+          assert math.isclose(float(p["x"]), 1113194.9079327357, rel_tol=0, abs_tol=1e-6), result
+          assert math.isclose(float(p["y"]), 2273030.9269876895, rel_tol=0, abs_tol=1e-6), result
+          assert float(p["z"]) == 123.45
+          print("Offline conversion passed:", result, "pyproj", pyproj.__version__, "PROJ",
+                pyproj.proj_version_str, "EPSG", pyproj.database.get_database_metadata("EPSG.VERSION"))
+          '
 
   client:
     name: Client (contract check)
