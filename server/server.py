@@ -13,6 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+import reference_services
+
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data"))
 FILES_DIR = Path(os.getenv("FILES_DIR", ROOT / "files"))
@@ -41,7 +43,7 @@ GROUPS_ALL = {
     "service.search.user", "service.storage.viewer", "service.storage.editor",
     "service.legal.user",
     "service.entitlements.user", "service.entitlements.admin",
-}
+} | reference_services.GROUPS
 GROUPS_BY_TOKEN = {TOKEN: set(GROUPS_ALL)} if TOKEN else {}
 
 STORE_LOCK = threading.RLock()
@@ -1064,6 +1066,37 @@ class Handler(BaseHTTPRequestHandler):
     def _is_public_path(self, path):
         return path in {"/health", "/info"} or path.startswith("/files/") or path.startswith("/upload/")
 
+    def _reference_request(self, method, parsed):
+        group = reference_services.route_group(method, parsed.path)
+        if group is None:
+            return False
+        if not self._rbac({group}):
+            return True
+        try:
+            payload = None
+            if method == "POST":
+                if self.headers.get("Transfer-Encoding"):
+                    raise reference_services.ReferenceError(400, "Transfer-Encoding is unsupported")
+                length_text = self.headers.get("Content-Length", "0")
+                length = reference_services.integer(length_text, "Content-Length")
+                if length > reference_services.MAX_BODY:
+                    self.close_connection = True
+                    raise reference_services.ReferenceError(413, "Reference service body exceeds 1 MiB")
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    raise reference_services.ReferenceError(400, "Incomplete JSON body")
+                payload = reference_services.strict_json(raw)
+            result = reference_services.handle(
+                method, parsed.path, parse_qs(parsed.query, keep_blank_values=True), payload)
+            # Validate new-service responses without altering legacy JSON behavior.
+            json.dumps(result, allow_nan=False)
+            self._json(200, result)
+        except reference_services.ReferenceError as exc:
+            self._error(exc.status, str(exc))
+        except Exception:
+            self._error(500, "Reference service operation failed")
+        return True
+
     def _check_auth(self, path):
         if not REQUIRE_AUTH or self._is_public_path(path):
             return True
@@ -1100,6 +1133,9 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
         if not self._check_auth(path):
+            return
+
+        if self._reference_request("GET", parsed):
             return
 
         if path in {"/health", "/info"}:
@@ -1543,6 +1579,8 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
         if not self._check_auth(path):
+            return
+        if self._reference_request("POST", parsed):
             return
         sweep_temp_state()
         payload = self._read_json()
