@@ -6,9 +6,11 @@ An in-memory emulator for the OSDU service APIs, for development, demos, and CI.
 [![Container image](https://github.com/sohaibqasem/osdu-lite/actions/workflows/publish-docker.yml/badge.svg)](https://github.com/sohaibqasem/osdu-lite/actions/workflows/publish-docker.yml)
 
 A small Python HTTP server that emulates selected contracts from Storage,
-Search, Dataset, File, Workflow, Legal, Schema, Entitlements, CRS and Unit. An OSDU client
-built against a real deployment points at `http://localhost:8089` instead and
-runs unchanged. Think LocalStack for OSDU: no cloud, no OpenSearch, no OIDC.
+Search, Dataset, File, Workflow, Legal, Schema, Entitlements, CRS, Unit, Indexer,
+Notification, Partition, Register and Secret. Clients exercising the supported
+subset can point at `http://localhost:8089`; check the operation inventory and
+documented mock limitations before substituting for a real deployment.
+No cloud, OpenSearch or OIDC is required.
 
 This repo also contains a working integration around it - the Well 360 example
 (Well -> Wellbore -> WellLog -> Dataset -> LAS) with a Java consumer compiled
@@ -52,7 +54,7 @@ on the existing Python 3.12 Alpine base without a compiler.
 
 ```bash
 make start        # build and start the emulator on :8089, 15 Well 360 records preloaded
-make smoke        # existing checks + CRS/Unit numerical assertions
+make smoke        # existing checks + numerical reference + community lifecycle HTTP checks
 make java         # reference client (real os-core-common) against the emulator
 make stop
 ```
@@ -91,6 +93,11 @@ All in memory; every process restart returns to a clean state.
 | CRS Catalog  | v3 subset | four fixed horizontal CRS entries, detail and filtered queries |
 | CRS Converter | v3 subset | offline pyproj x/y conversion, ordered batches; z retained |
 | Unit         | v3 subset | 17 fixed units, six dimensions, scale/offset coefficients |
+| Indexer      | v2 mock | synchronous reindex into existing Search, record reindex, kind index deletion |
+| Notification | v1 mock | validate/record incoming records-changed events; no external delivery |
+| Partition    | v1 mock | property CRUD; does not provision additional authenticated tenants |
+| Register     | v1 mock | subscriptions, secret rotation, DDMS data and exact-filter actions |
+| Secret       | v2 mock | memory-only ACL-controlled values, enable/disable, value-free lists |
 
 Two behaviors matter for anyone writing code against it:
 
@@ -142,6 +149,137 @@ examples/well360/
 The supported routes are listed below. Reference-service compatibility decisions
 and limitations are explicit in the following section.
 
+### Independently sourced public community extensions
+
+The extension inventory is
+[`server/data/community_api.json`](server/data/community_api.json): **126
+method/path operations across 16 services**, including nine preserved reference
+operations and the existing Search health routes. It is an extension coverage
+inventory, **not a count of all legacy routes or a claim of full production API
+parity**. `test_pinned_inventory_success` executes every inventory entry, checks
+its success status/envelope and observable behavior, and rejects missing coverage.
+The existing 88 baseline tests remain unchanged.
+
+Each entry inherits its exact source URL, public API version, capability
+(`native` or `mock`), and SHA-256 from the service. Repository revisions pin the
+independently verified **Apache-2.0 LICENSE** and source-only operations; live
+OpenAPI documents are independently pinned by their content hashes, not assumed
+to have been generated from those commits. Source paths and fingerprints are
+recorded for Partition's hidden write APIs and Notification's push handler and
+Core Plus envelope extractor. Inventory origin:
+[community Core Services Overview](https://community.opengroup.org/groups/osdu/platform/-/wikis/Core-Services-Overview).
+Only independently retrieved public community contracts/code were used; no
+private standard text or draft-derived artifacts are distributed or claimed as
+implemented.
+
+| Area | Public operations added or expanded |
+| --- | --- |
+| Indexer v2 | `PUT /partitions/provision`, `POST/PATCH /reindex`, `POST /reindex/records`, `DELETE /index?kind=...` |
+| Partition v1 | `GET /partitions`; `POST/GET/PATCH/DELETE /partitions/{partitionId}` |
+| Register v1 | subscription create/read/query/list/delete and secret rotation; DDMS create/read/type-query/delete; action create/read/delete/test/retrieve; topics |
+| Secret v2 | create, get, update, delete, ID list, value-free batch metadata, enable/disable; public health remains v1 |
+| Notification v1 | `POST /push-handlers/records-changed`, `GET /_ah/warmup` |
+| Unit v3 | catalog/search/lastmodified/mapstates; measurement lookup/search; unit lookup/search/preferred; SI unit-system lookup/list/assignments; `GET/POST /conversion/abcd` |
+| CRS Catalog v3 | coordinate-transformation query/detail and `POST /points-in-aou` |
+| CRS Converter v3 | `POST /convertGeoJson`, `POST /convertTrajectory` |
+| Existing services | slash-free Dataset single registry GET, undelete; all-partition groups and global member removal; File URL revoke; Legal status job; Storage replay/status, batch/header reads, public `:delete`, historical-version purge; Workflow system registration/deletion and run latestInfo |
+| Health/info | exact publicly inventoried paths, with auth/RBAC; no arbitrary `/service/*` fallback |
+
+**State and safety.** New CRUD collections, replay jobs and incoming events are
+in-memory only, bounded to 1,000 per collection, and reset by `clear_state` /
+`POST /poc/reset`. New JSON bodies are limited to 1 MiB and reject duplicate keys,
+malformed framing and nonfinite numbers. Reference batches are limited to 1,000
+points. The demo token is seeded with explicitly **local**, not upstream, service
+roles (`osdu-lite.<service>.user`; existing CRS role spellings are preserved).
+The configured bearer token and `data-partition-id` checks run before dispatch;
+auth-disabled development mode is retained. All responses support correlation
+and CORS, including 204s. Unknown/unregistered methods and resources do not
+silently succeed.
+
+Partition CRUD stores property objects `{"properties":{"region":{"sensitive":false,
+"value":"local"}}}`; it neither changes the single configured authentication
+partition nor grants access to other tenants. Sensitive partition properties
+are configuration data, **not** a production secret store.
+
+Secret create/update use `{"id":"mock-key","value":"mock-only","secretAcls":
+{"owners":[...],"viewers":[...]}}`. Owner membership is required for writes;
+viewers/owners can read. Disabled secrets return 409 on value reads; list and
+batch-list responses never include values. Subscription credentials are also
+memory-only and omitted from every registration response. **Never send real
+credentials**: there is no encryption, durable storage, cloud vault, credential
+rotation service or production IAM.
+
+Notification uses the public Core Plus envelope: `subscription` is a resource
+path ending in the registration's `notificationId`, `message.data` is base64 JSON,
+and `message.attributes["data-partition-id"]` matches the configured partition.
+An accepted event records its matching subscription IDs with `delivered=false`;
+there are **no HTTP callbacks**. DDMS URLs are inert data and never fetched.
+Actions use exact `entityType`/`source`/`version` filters and static HTTP(S) URLs;
+the components are derived from a record's `authority:source:entityType:version`
+`kind`. Remote expressions and URL-template evaluation are deliberately unsupported.
+
+Indexer operations synchronously rebuild the existing in-memory Search view,
+exclude soft-deleted records, and reject unknown IDs. Storage replay is a
+synchronous mock job with completed per-kind status, not a cloud queue/event
+replay. Historical version purge accepts `versionIds` or `from`/`limit`, and
+refuses to delete the latest version. File revoke invalidates the local mock
+storage account's outstanding upload grants; it is not cloud signed-URL
+cryptography or revocation of already downloaded files.
+
+**Reference extensions.** The 17 units and four CRSs do not inflate the 15 seeded
+Storage records. Unit POST lookups resolve existing essences, not create new
+definitions. ABCD coefficients use `y=(a+b*x)/(c+d*x)`; for existing affine
+coefficients they are `a=-scale*offset, b=scale, c=1, d=0`. New Unit essence
+lookups also validate the public UAD/ABCD form; legacy `/conversion/scale`
+retains its strict USO shape. The sole unit system is honestly named
+`OSDU-Lite SI`. Namespace maps/mapstates return empty, not invented mappings.
+Catalog search supports `*` or literal text only; unsupported query syntax
+returns 400. Catalog search includes units and measurements with combined
+pagination. The namespace remains `osdu-lite`, not an asserted upstream alias.
+Generated upstream documents contain two notable schema inconsistencies: some
+204 responses declare bodies (this server correctly sends no body), and
+GeoJSON's generated `oneOf` geometry variants have overlapping type constraints.
+The emulator uses standard GeoJSON geometry discriminators, not artificial fields
+to satisfy an ambiguous union.
+
+CRS transformation records are **local horizontal projection operations**, not
+official datum-transformation records. Area checks use the catalog's rectangular
+operating extents and geodesic approximate distances to the bounding box.
+GeoJSON recursively visits Feature/Geometry collections and all standard geometry
+coordinate arrays, preserves properties, removes stale bboxes, accepts
+catalog-issued CRS IDs/references, and performs real offline horizontal PROJ
+conversion. Any out-of-domain position rejects the whole GeoJSON operation (422);
+no nonfinite numeric JSON or silent partial geometry is returned. Optional Z
+unit rescaling is linear, never a vertical datum transformation.
+
+Trajectory is explicitly **mock/approximate**, not survey-accurate: local
+minimum-curvature integration, `TRUE_NORTH`, `AzimuthalEquidistant`, increasing
+MD/inclination/azimuth stations starting at MD 0, at most 1,000 stations and
+100 km measured depth. `inputStations` is JSON serialized into a string, as in
+the public schema. Units are catalog Length essences/OSDU unit IDs. It returns
+computed local deviations and geographic positions, with positive-down `dz`;
+`operationsApplied` explicitly disclaims survey accuracy, grid convergence,
+datum correction and interpolation. LMP, other station kinds and antiparallel
+adjacent tangents are rejected rather than echoed as successful conversions.
+
+**Explicit exclusions:** Policy and Project & Workflow services; `convertBinGrid`;
+official datum/grid transformations, complete CRS/unit catalogs; DDMS redirects;
+remote action expression/template evaluation; cross-namespace Storage copying;
+tenant provisioning; and unlisted upstream functionality. Existing legacy
+interfaces and emulator-specific payloads are preserved, not re-labelled as
+newly verified production conformance.
+
+Run the additional stdlib-only HTTP smoke against a local test instance:
+
+```bash
+python server/community-smoke-test.py
+```
+
+It exercises all 16 infos, new mock lifecycles, indexing/Search, replay, Dataset
+undelete, GeoJSON, ABCD, auth/error handling, and CORS/correlation. Temporary
+records/resources are cleaned up and the original Storage count is checked.
+Incoming mock notification events/replay statuses remain until reset/restart.
+
 ### CRS and Unit: bounded community v3 subset
 
 This is **partial community-API emulation, not OSDU Standard v1.0 compliance,
@@ -182,7 +320,7 @@ GET requires exactly one `recordId` with a terminating colon, e.g.
 `dataId=Geographic2D:EPSG::4326` (no terminating colon), and returns full detail in
 `searchResults.results` plus `totalCount`. Unknown identifiers return 404.
 
-**Converter.** Pass the exact JSON-serialized `data.PersistableReference` strings
+**Point converter (`/convert`).** Pass the exact JSON-serialized `data.PersistableReference` strings
 returned by this catalog as `fromCRS`/`toCRS`, with `points: [{"x":10,"y":20,"z":123.45}]`.
 Only catalog-issued definitions are accepted, ignoring JSON whitespace/key order
 but checking all WKT and metadata. These local LBC references use bundled PROJ
@@ -235,8 +373,9 @@ not supported. Dimensions must match. GET scale requires `namespaces`, `fromSymb
 and exactly one of `toUnit`/`toUnitPersistableReference`. Objects must match catalog
 `essence`; string references are the corresponding `essenceJson`. The source-backed
 wire field is `baseMeasurement`, not the generated interface's `baseMeasurementEssence`.
-Caller-supplied conflicting coefficients are rejected; there is no general ABCD
-or converted-value/batch endpoint.
+Caller-supplied conflicting coefficients are rejected. The new
+`/conversion/abcd` route covers affine coefficients only; there is no general
+nonlinear-unit solver or converted-value/batch endpoint.
 
 The response is `fromUnit`, `toUnit`, `scaleOffset` using **`y = scale * (x - offset)`**.
 For example `degF` → `degC` yields scale 5/9 and offset 32; applying to 212 gives 100.
@@ -434,22 +573,28 @@ that returns zero after about a second.
 
 ## Tests
 
-Zero-dependency unit suite, stdlib `unittest`, no Docker or live server:
+The test runner uses stdlib `unittest`, with pinned runtime dependencies installed;
+no Docker or live server is needed:
 
 ```bash
 make test
 ```
 
-73 tests cover: record validation and version history; PATCH, `:copy`, batch and
+Tests cover: record validation and version history; PATCH, `:copy`, batch and
 single delete, hard purge; the search query language and cursor lifecycle; the
 indexer delay; Dataset upload -> register -> retrieval with size + SHA-256;
 batch register, revokeURL, soft delete; File v2 metadata/uploadURL/delivery;
 Workflow deploy/list/run and manifest ingest; LegalTag CRUD, validate, and
 `:query` operators; Schema list/create/system; entitlements membersCount/appIds;
-RBAC 403s; token and cursor TTL cleanup.
+RBAC 403s; token and cursor TTL cleanup; all 126 inventoried public operations;
+new-service read-after-write/update/delete/enable-disable lifecycles; ACL/value
+redaction, limits, malformed framing, reset isolation; and reference numerical
+checks. Inventory coverage is checked independently of the dispatcher's route
+registration.
 
 CI (`.github/workflows/ci.yml`) runs the unit suite, starts the emulator for
-`smoke-test.sh`, and runs the client contract check (pinned os-core-common
+`smoke-test.sh`, `reference-smoke-test.sh`, and `community-smoke-test.py`, and runs
+the client contract check (pinned os-core-common
 3.1.0 API surface, fully offline - the OSDU community Maven registry has been
 flaky since the OSDU->OpenDES hosting migration). A second workflow builds and
 publishes the multi-arch container image to GHCR.

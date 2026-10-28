@@ -4,6 +4,8 @@ COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r /app/requirements.txt
 COPY server.py /app/server.py
 COPY reference_services.py /app/reference_services.py
+COPY reference_extensions.py /app/reference_extensions.py
+COPY community_services.py /app/community_services.py
 COPY data /app/data
 COPY files /app/files
 EXPOSE 8089

@@ -1,0 +1,156 @@
+{
+  "retrieved": "2026-10-28",
+  "scope": "Public community extension inventory, not production parity or conformance to any private draft. Operations inherit source, version, revision and capability from their service. Existing legacy operations remain supported separately.",
+  "license": "Apache-2.0; LICENSE verified at each repository revision below",
+  "licenseEvidence": {
+    "filename": "LICENSE",
+    "defaultSha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+    "sha256Overrides": {
+      "partition": "6c28080ef4cf1995ecf1110fdb59162b7fd9aa3e0a8173696aaabe4c1ae6af24",
+      "secret": "d553149e55da826b27400bdcb6b2e95bee20e7f4714bfc2f863e7cf38da85381",
+      "crs-converter": "f18a8de9c382f283447f6e277003deb6e2492c135317af7573ee67a6ec8ecf7b",
+      "entitlements": "a13cf7d8ed4f560763c6e5d6ed985ae979692e2b02095d368ffc274523d7925b"
+    }
+  },
+  "sourceRoot": "https://community.opengroup.org/osdu/platform/",
+  "liveRoot": "https://dev.osdu-main.osdu-cimpl.opengroup.org",
+  "services": {
+    "indexer": {
+      "base": "/api/indexer/v2", "version": "2.0", "capability": "mock",
+      "repository": "system/indexer-service", "revision": "7e2ec02be240ce38e521ce227a2258b7e9f933dc",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/indexer/v2/api-docs.yaml",
+      "sha256": "5029832360e5478ee3c34ee35daea549d8b82bc522bcdf0f5c537eaa73e18b51",
+      "operations": ["PUT /partitions/provision", "POST /reindex", "PATCH /reindex", "POST /reindex/records", "DELETE /index", "GET /info", "GET /readiness_check", "GET /liveness_check"]
+    },
+    "notification": {
+      "base": "/api/notification/v1", "version": "1.0.0", "capability": "mock",
+      "repository": "system/notification", "revision": "9c094403fd64c83193bf19d607c813e369977633",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/notification/v1/api-docs.yaml",
+      "sha256": "02e1f24e07fcb11458926763bc0ecb583d56f7c74cfbd94f7f858324a853af52",
+      "sourceOverrideSha256": "dcc8d7582ecd3548e315341e316991549ac498638b70a3f7784814ba77fe15af",
+      "envelopeSource": "notification-core-plus/src/main/java/org/opengroup/osdu/notification/pubsub/PubsubRequestBodyExtractor.java",
+      "envelopeSha256": "a1d6bf899c47cffc0afb87dcf0fb663d4b366a2d99c7cfd6c881e055b6e336d2",
+      "operations": ["GET /info", "GET /_ah/warmup", "POST /push-handlers/records-changed"],
+      "sourceOverrides": {"POST /push-handlers/records-changed": "notification-core/src/main/java/org/opengroup/osdu/notification/api/PubsubEndpoint.java"}
+    },
+    "partition": {
+      "base": "/api/partition/v1", "version": "1.0", "capability": "mock",
+      "repository": "system/partition", "revision": "f93508aaf54c3b760ad54770b90be973a45bee8d",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/partition/v1/api-docs.yaml",
+      "sha256": "02cb853267f5763841db45844a086c9f759c6ea463665a76275aa78ec0bedd3b",
+      "sourceOverrideSha256": "765461243613923eb2e947e39532d87a6fc719eb07b8042a5701f6377315b162",
+      "operations": ["GET /partitions", "GET /partitions/{partitionId}", "POST /partitions/{partitionId}", "PATCH /partitions/{partitionId}", "DELETE /partitions/{partitionId}", "GET /info", "GET /liveness_check"],
+      "sourceOverrides": {
+        "POST /partitions/{partitionId}": "partition-core/src/main/java/org/opengroup/osdu/partition/api/PartitionApi.java",
+        "PATCH /partitions/{partitionId}": "partition-core/src/main/java/org/opengroup/osdu/partition/api/PartitionApi.java",
+        "DELETE /partitions/{partitionId}": "partition-core/src/main/java/org/opengroup/osdu/partition/api/PartitionApi.java"
+      }
+    },
+    "register": {
+      "base": "/api/register/v1", "version": "1.0", "capability": "mock",
+      "repository": "system/register", "revision": "8e242d74cf6aed9e2be1034d289fb6f6562d14fa",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/register/v1/api-docs.yaml",
+      "sha256": "875d6c9ec625b3cae7da243a6b5b579cdc24984008f27e7d5db2776a0d5bd51c",
+      "operations": ["PUT /subscription/{id}/secret", "GET /subscription", "POST /subscription", "GET /ddms", "POST /ddms", "POST /action", "POST /action:test", "POST /action:retrieve", "GET /topics", "GET /subscriptions", "GET /subscription/{id}", "DELETE /subscription/{id}", "GET /ddms/{id}", "DELETE /ddms/{id}", "GET /action/{id}", "DELETE /action/{id}", "GET /info", "GET /readiness_check", "GET /liveness_check"]
+    },
+    "secret": {
+      "base": "/api/secret", "version": "1.0.0", "capability": "mock",
+      "repository": "security-and-compliance/secret", "revision": "3cb2ed7134ee05c80783c03b4605d843301f6c1f",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/secret/api-docs.yaml",
+      "sha256": "b35c8dce6c2c9d1822f9986ec49fdaffdf043e410b9859bb94709a2a5430be3b",
+      "operations": ["GET /v2/secrets/{secretId}", "PUT /v2/secrets/{secretId}", "DELETE /v2/secrets/{secretId}", "POST /v2/secrets", "GET /v2/secrets/list", "POST /v2/secrets/list", "PATCH /v2/secrets/{secretId}/enable", "PATCH /v2/secrets/{secretId}/disable", "GET /v2/info", "GET /v1/health"]
+    },
+    "unit": {
+      "base": "/api/unit/v3", "version": "3.0.0", "capability": "native",
+      "repository": "system/reference/unit-service", "revision": "2cb63270f2e5588ddc05e697b1b5d7f3af95a861",
+      "source": "https://osdu-glab.msft-osdu-test.org/api/unit/api-docs/v3",
+      "sha256": "9b51fb40ecc41fe8a9576d3861d55a33e607a2d30074626a7b5b0d9c8cab8778",
+      "operations": ["GET /unitsystem", "POST /unitsystem", "GET /unit", "POST /unit", "GET /unit/unitsystem", "POST /unit/unitsystem", "POST /unit/search", "GET /unit/measurement", "POST /unit/measurement", "GET /unit/measurement/preferred", "POST /unit/measurement/preferred", "GET /measurement", "POST /measurement", "POST /measurement/search", "GET /conversion/scale", "POST /conversion/scale", "GET /conversion/abcd", "POST /conversion/abcd", "POST /catalog/search", "GET /unitsystem/list", "GET /unit/symbols", "GET /unit/symbol", "GET /unit/maps", "GET /measurement/maps", "GET /measurement/list", "GET /catalog", "GET /catalog/mapstates", "GET /catalog/lastmodified", "GET /info", "GET /_ah/readiness_check", "GET /_ah/liveness_check"],
+      "coefficientSources": {
+        "unit-core/src/main/java/org/opengroup/osdu/unitservice/interfaces/ABCD.java": "6fed668042d79c16503d11aff4550608239f63d46aeca2e8e8622464cfb02299",
+        "unit-core/src/main/java/org/opengroup/osdu/unitservice/interfaces/ScaleOffset.java": "06f4d6b5796cbf4350fef274ccaee5c35718b09791ebe68592f3aa70a9fc1461"
+      },
+      "notes": "Curated 17-unit catalog, local namespaces and SI unit system; not full upstream catalog. ABCD y=(a+b*x)/(c+d*x), scale y=scale*(x-offset), independently verified in the public interface sources."
+    },
+    "crs-catalog": {
+      "base": "/api/crs/catalog/v3", "version": "3.0.0", "capability": "native",
+      "repository": "system/reference/crs-catalog-service", "revision": "3d98e8e7f6ff69c06455f8b5c525027779c6fe5f",
+      "source": "https://osdu-glab.msft-osdu-test.org/api/crs/catalog/api-docs/v3",
+      "sha256": "ac4fa915f39fb6e2f9c5f5ee47c70dd7c111fcf7f72bd4fb35a04df0d727a7e7",
+      "operations": ["GET /coordinate-reference-system", "POST /coordinate-reference-system", "GET /coordinate-transformation", "POST /coordinate-transformation", "POST /points-in-aou", "GET /info"],
+      "notes": "Four fixed CRSs; local horizontal projection-operation catalog, not official datum-transformation records. Area checks are rectangular catalog extents."
+    },
+    "crs-converter": {
+      "base": "/api/crs/converter/v3", "version": "3.0.0", "capability": "native",
+      "repository": "system/reference/crs-conversion-service", "revision": "61d4ca15728d80f09819999fc446ae5b03925ff0",
+      "source": "https://osdu-glab.msft-osdu-test.org/api/crs/converter/api-docs/v3",
+      "sha256": "bea27b78d884b0087e816189a6b1d3793ad122a943bf16d9f212b9f78f92dd26",
+      "operations": ["POST /convert", "POST /convertGeoJson", "POST /convertTrajectory", "GET /info", "GET /_ah/readiness_check", "GET /_ah/liveness_check"],
+      "capabilityOverrides": {"POST /convertTrajectory": "mock"},
+      "notes": "Offline horizontal PROJ transforms. Trajectory is explicitly approximate, bounded MD/inclination/azimuth with TRUE_NORTH and AzimuthalEquidistant only, never survey accuracy."
+    },
+    "dataset": {
+      "base": "/api/dataset/v1", "version": "1.0.0", "capability": "mock",
+      "repository": "system/dataset", "revision": "28a07b98d9b5bb1f1b2a8b890d41ce198cfc3e1c",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/dataset/v1/api-docs.yaml",
+      "sha256": "912170f65991f95c248cb442b59ce6b11b2c032fe6b8bdfd61c51e11aca74f3f",
+      "operations": ["GET /getDatasetRegistry", "POST /metadataRecord/{id}/undelete", "GET /info", "GET /liveness_check"]
+    },
+    "entitlements": {
+      "base": "/api/entitlements/v2", "version": "2.0", "capability": "mock",
+      "repository": "security-and-compliance/entitlements", "revision": "f1cb7132c189abadafec46b57e5ce4f3913153e3",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/entitlements/v2/api-docs.yaml",
+      "sha256": "72a8cdd440866e3dd4df9f0abadb4125efec791371e9d64ef5fb8f630a8ec129",
+      "operations": ["GET /groups/all", "DELETE /members/{member_email}", "GET /info", "GET /_ah/readiness_check", "GET /_ah/liveness_check"]
+    },
+    "file": {
+      "base": "/api/file/v2", "version": "2.0.0", "capability": "mock",
+      "repository": "system/file", "revision": "d5ea608caae0e1fc70e6200f1b04746f6684d44c",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/file/v2/api-docs.yaml",
+      "sha256": "bd5d9ae45b9073671ccf3ca0e23c0f3f0bf60beae359878e446df096870cb65a",
+      "operations": ["POST /files/revokeURL", "GET /info", "GET /readiness_check", "GET /liveness_check"]
+    },
+    "legal": {
+      "base": "/api/legal/v1", "version": "1.0.0", "capability": "mock",
+      "repository": "security-and-compliance/legal", "revision": "aa612c2a9798a1c40449cba65c32cd25727dec40",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/legal/v1/api-docs.yaml",
+      "sha256": "360f58bcedd6cfdfa00df31cfc51c6da61df2eb899cd2fca15cbd5db95efdbdf",
+      "operations": ["GET /jobs/updateLegalTagStatus", "GET /info", "GET /_ah/readiness_check", "GET /_ah/liveness_check"]
+    },
+    "schema": {
+      "base": "/api/schema-service/v1", "version": "1.0", "capability": "mock",
+      "repository": "system/schema-service", "revision": "c6adbaa2998346b42191a9e93ddf226b593c1ff8",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/schema-service/v1/api-docs.yaml",
+      "sha256": "2ec44ba7d30e3e98076c83df65975e4ef074b2c83dcfa63683091be9c1384b34",
+      "operations": ["GET /info", "GET /liveness_check"]
+    },
+    "search": {
+      "base": "/api/search/v2", "version": "2.0", "capability": "mock",
+      "repository": "system/search-service", "revision": "801ecd7f9559d6c0da93e814162eba389f54a54c",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/search/v2/api-docs.yaml",
+      "sha256": "361b5caa4103ba9fc9e8b1c4f059eb25f5e1986ffff2841cf14d6dc13cb758c8",
+      "operations": ["GET /info", "GET /readiness_check", "GET /liveness_check"]
+    },
+    "storage": {
+      "base": "/api/storage/v2", "version": "2.0.0", "capability": "mock",
+      "repository": "system/storage", "revision": "d22d8766124753c18cf030e88c18eb9ac14cdbdc",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/storage/v2/api-docs.yaml",
+      "sha256": "114edbb99a302a27119c97380bff8670bc5205f8acd3f597564cee98fc5d5637",
+      "operations": ["POST /replay", "GET /replay/status/{id}", "POST /query/records:batch", "POST /query/records/headers", "POST /records/{id}:delete", "DELETE /records/{id}/versions", "GET /info", "GET /liveness_check"]
+    },
+    "workflow": {
+      "base": "/api/workflow", "version": "2.0.5", "capability": "mock",
+      "repository": "data-flow/ingestion/ingestion-workflow", "revision": "fb2a589f29ca7d3ffa7dd5f7e7ca49ef58db114c",
+      "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/workflow/api-docs.yaml",
+      "sha256": "cc029692f08fdb6c4a49b1bfcdfb3e753bd3e0590268b4311aa6e8a7847eab09",
+      "operations": ["POST /v1/workflow/system", "DELETE /v1/workflow/system/{workflow_name}", "GET /v1/workflow/{workflow_name}/workflowRun/{runId}/latestInfo", "GET /v1/info", "GET /readiness_check", "GET /liveness_check"]
+    }
+  },
+  "excluded": [
+    "Policy and Project & Workflow services (outside requested scope)",
+    "CRS convertBinGrid, official datum/grid transformations and full upstream CRS/unit catalogs",
+    "Register DDMS URL redirect and remote action expression evaluation (stored registration only; no external callbacks)",
+    "Storage cross-namespace reference copying and Entitlements tenant provisioning (single configured authentication partition)",
+    "Unlisted upstream operations and production provider backends; legacy routes are not a full public-contract conformance claim"
+  ]
+}

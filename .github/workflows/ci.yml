@@ -21,7 +21,7 @@ jobs:
 
       - name: Syntax checks
         run: |
-          python -m py_compile server/server.py server/reference_services.py server/tests/test_reference_services.py
+          python -m py_compile server/server.py server/reference_services.py server/reference_extensions.py server/community_services.py server/community-smoke-test.py server/tests/test_reference_services.py server/tests/test_community_services.py
           for f in demo-all.sh examples/well360/demo/*.sh server/*.sh examples/well360/client/*.sh; do
             bash -n "$f" || exit 1
           done
@@ -42,6 +42,7 @@ jobs:
           done
           server/smoke-test.sh
           bash server/reference-smoke-test.sh
+          python server/community-smoke-test.py
 
   reference-container:
     name: Offline reference services (${{ matrix.platform }})

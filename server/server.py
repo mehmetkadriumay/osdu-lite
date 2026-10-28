@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -14,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import reference_services
+import community_services
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data"))
@@ -43,10 +45,12 @@ GROUPS_ALL = {
     "service.search.user", "service.storage.viewer", "service.storage.editor",
     "service.legal.user",
     "service.entitlements.user", "service.entitlements.admin",
-} | reference_services.GROUPS
+} | reference_services.GROUPS | community_services.GROUPS
+community_services.reset(PARTITION)
 GROUPS_BY_TOKEN = {TOKEN: set(GROUPS_ALL)} if TOKEN else {}
 
 STORE_LOCK = threading.RLock()
+STATE_GENERATION = 0
 RECORD_BY_ID = {}
 SEARCH_BY_ID = {}
 UPLOAD_TOKENS = {}
@@ -224,7 +228,9 @@ def build_full_sample_records():
 FULL_SAMPLE = build_full_sample_records()
 
 def clear_state():
+    global STATE_GENERATION
     with STORE_LOCK:
+        STATE_GENERATION += 1
         RECORD_BY_ID.clear()
         SEARCH_BY_ID.clear()
         UPLOAD_TOKENS.clear()
@@ -244,6 +250,7 @@ def clear_state():
     REVOKED_URLS.clear()
     SCHEMAS.clear()
     RECORD_TS.clear()
+    community_services.reset(PARTITION)
 
 def iso_to_epoch(value):
     if value is None:
@@ -314,12 +321,15 @@ def validate_record(rec):
 def index_record_later(record):
     rid = record["id"]
     snapshot = deepcopy(record)
+    with STORE_LOCK:
+        generation = STATE_GENERATION
     def apply():
         time.sleep(INDEX_DELAY_SECONDS)
         with STORE_LOCK:
             # only index if the stored record is still exactly the one we indexed
             current = RECORD_BY_ID.get(rid)
-            if current and current.get("version") == snapshot.get("version") and rid not in DELETED:
+            if (generation == STATE_GENERATION and current
+                    and current.get("version") == snapshot.get("version") and rid not in DELETED):
                 SEARCH_BY_ID[rid] = snapshot
     threading.Thread(target=apply, daemon=True).start()
 
@@ -1050,6 +1060,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _no_content(self):
         self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if self.headers.get("correlation-id"):
+            self.send_header("correlation-id", self.headers.get("correlation-id"))
         self.end_headers()
 
     def _read_json(self):
@@ -1097,6 +1110,54 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, "Reference service operation failed")
         return True
 
+    def _community_request(self, method, parsed):
+        # Preserve every existing strict reference endpoint and its legacy envelope.
+        if reference_services.route_group(method, parsed.path) is not None:
+            return False
+        route = community_services.match(method, parsed.path)
+        if route is None:
+            return False
+        if not self._rbac({community_services.group(route[0])}):
+            return True
+        try:
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                raise reference_services.ReferenceError(400, "Transfer-Encoding is unsupported")
+            length = reference_services.integer(self.headers.get("Content-Length", "0"), "Content-Length")
+            if length > reference_services.MAX_BODY:
+                self.close_connection = True
+                raise reference_services.ReferenceError(413, "Community service body exceeds 1 MiB")
+            if method == "GET" and length:
+                raise reference_services.ReferenceError(400, "GET request bodies are unsupported")
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise reference_services.ReferenceError(400, "Incomplete JSON body")
+            payload = reference_services.strict_json(raw) if raw else {}
+            status, result = community_services.handle(
+                sys.modules[__name__], route, method,
+                parse_qs(parsed.query, keep_blank_values=True), payload, group_for_caller(self))
+            json.dumps(result, allow_nan=False)
+            if status == 204:
+                self._no_content()
+            elif route[0] == "secret" and route[1] == "/v1/health":
+                body = result.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                if self.headers.get("correlation-id"):
+                    self.send_header("correlation-id", self.headers.get("correlation-id"))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._json(status, result)
+        except reference_services.ReferenceError as exc:
+            self._error(exc.status, str(exc))
+        except Exception:
+            # Do not log request data: a request may contain a mock credential.
+            self._error(500, "Community service operation failed")
+        return True
+
     def _check_auth(self, path):
         if not REQUIRE_AUTH or self._is_public_path(path):
             return True
@@ -1125,7 +1186,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, data-partition-id, correlation-id, frame-of-reference")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
         self.end_headers()
 
     def do_GET(self):
@@ -1135,7 +1196,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_auth(path):
             return
 
-        if self._reference_request("GET", parsed):
+        if self._community_request("GET", parsed) or self._reference_request("GET", parsed):
             return
 
         if path in {"/health", "/info"}:
@@ -1580,7 +1641,7 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         if not self._check_auth(path):
             return
-        if self._reference_request("POST", parsed):
+        if self._community_request("POST", parsed) or self._reference_request("POST", parsed):
             return
         sweep_temp_state()
         payload = self._read_json()
@@ -2118,6 +2179,8 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if not self._check_auth(path):
             return
+        if self._community_request("PUT", parsed):
+            return
 
         if path.startswith("/upload/"):
             token = path[len("/upload/"):]
@@ -2245,6 +2308,8 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
         if not self._check_auth(path):
+            return
+        if self._community_request("DELETE", parsed):
             return
         sweep_temp_state()
 
@@ -2385,6 +2450,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if not self._check_auth(path):
+            return
+        if self._community_request("PATCH", parsed):
             return
         payload = self._read_json()
         if payload is None:

@@ -4,6 +4,31 @@ All notable changes to OSDU-Lite are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- Independently pinned Apache-2.0 public community extension inventory: 126
+  method/path operations across 16 services, with source versions, revisions
+  and SHA-256 fingerprints. This is a bounded test-double inventory, not full
+  production parity or private-standard conformance.
+- Stateful in-memory Indexer, Notification, Partition, Register and Secret
+  mocks, resource/body limits, local RBAC, secret ACLs/value-free lists and
+  reset isolation. No outbound callbacks or provider infrastructure.
+- Unit catalog/measurement/unit-system lookups and validated affine ABCD
+  coefficients; local CRS projection-operation catalog and area checks;
+  recursive real offline GeoJSON conversion and explicitly approximate mock
+  minimum-curvature trajectories.
+- Missing public operations in Dataset, Entitlements, File, Legal, Storage
+  and Workflow, while preserving legacy contracts and the 15-record sample.
+- Per-operation behavioral acceptance checks, lifecycle/error/numerical tests
+  and stdlib HTTP community smoke integrated into CI/Make smoke targets.
+  Container packaging copies the additional modules without changing the base.
+
+### Fixed
+- Reset isolation now prevents delayed indexing work from a previous state
+  generation from indexing a newly recreated ID/version. A deterministic
+  regression covers the race previously visible in the index-delay baseline.
+
 ## [v0.7.0-beta.1] - 2026-08-29
 
 First beta release. Closes the remaining official-API surface gaps of the

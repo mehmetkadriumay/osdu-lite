@@ -16,6 +16,7 @@ stop: ## Stop the local façade
 smoke: ## Run health + smoke checks against the local façade
 	cd server && ./smoke-test.sh
 	cd server && bash ./reference-smoke-test.sh
+	python3 server/community-smoke-test.py
 
 pull-up: ## Pull the published image from GHCR and start it
 	cd server && docker compose -f compose.pull.yaml up -d
@@ -26,6 +27,7 @@ pull-down: ## Stop the image-based façade
 pull-smoke: ## Health + smoke checks against the pulled image
 	cd server && ./smoke-test.sh
 	cd server && bash ./reference-smoke-test.sh
+	python3 server/community-smoke-test.py
 
 java: ## Run the real os-core-common Java consumer (façade must be started)
 	cd examples/well360/client && ./run.sh
