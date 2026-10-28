@@ -16,7 +16,7 @@
   "liveRoot": "https://dev.osdu-main.osdu-cimpl.opengroup.org",
   "services": {
     "indexer": {
-      "base": "/api/indexer/v2", "version": "2.0", "capability": "mock",
+      "base": "/api/indexer/v2", "version": "2.0", "capability": "local-opensearch",
       "repository": "system/indexer-service", "revision": "7e2ec02be240ce38e521ce227a2258b7e9f933dc",
       "source": "https://dev.osdu-main.osdu-cimpl.opengroup.org/api/indexer/v2/api-docs.yaml",
       "sha256": "5029832360e5478ee3c34ee35daea549d8b82bc522bcdf0f5c537eaa73e18b51",

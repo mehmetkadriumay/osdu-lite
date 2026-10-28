@@ -146,30 +146,20 @@ def partition_api(method, suffix, args, query, payload):
 
 
 def index_records(s, ids=None, kind=None, clean=False):
-    with s.STORE_LOCK:
-        if clean:
-            for rid, record in list(s.SEARCH_BY_ID.items()):
-                if kind is None or fnmatch.fnmatchcase(record["kind"], kind):
-                    del s.SEARCH_BY_ID[rid]
-        selected = [record for rid, record in sorted(s.RECORD_BY_ID.items())
-                    if rid not in s.DELETED and (ids is None or rid in ids)
-                    and (kind is None or fnmatch.fnmatchcase(record["kind"], kind))]
-        for record in selected:
-            s.SEARCH_BY_ID[record["id"]] = deepcopy(record)
-        return deepcopy(selected)
+    return s.index_current_records(ids=ids, kind=kind, clean=clean)
 
 
 def indexer_api(s, method, suffix, query, payload):
     q = ref.query_values(query, {"kind"} if suffix == "/index" else
                          {"force_clean"} if suffix == "/reindex" else {})
     if suffix == "/partitions/provision":
-        return 200, None  # The single in-memory index needs no external provisioning.
+        with s.STORE_LOCK:
+            s.SEARCH_BACKEND.provision()
+        return 200, None
     if suffix == "/index":
         kind = ref.text(q.get("kind"), "kind")
         with s.STORE_LOCK:
-            for rid, record in list(s.SEARCH_BY_ID.items()):
-                if record["kind"] == kind:
-                    del s.SEARCH_BY_ID[rid]
+            s.delete_index_kind(kind)
         return 200, None
     clean = ref.boolean(q["force_clean"], "force_clean") if "force_clean" in q else False
     if suffix == "/reindex/records":
@@ -178,12 +168,14 @@ def indexer_api(s, method, suffix, query, payload):
         with s.STORE_LOCK:
             if any(rid not in s.RECORD_BY_ID or rid in s.DELETED for rid in ids):
                 raise ref.ReferenceError(404, "One or more records do not exist")
-        index_records(s, ids=ids)
+            index_records(s, ids=ids)
         return 202, {}
     kind = None
     if method == "POST":
         obj(payload, {"kind"}, {"kind", "cursor"})
         kind = ref.text(payload["kind"], "kind")
+        if "cursor" in payload and not isinstance(payload["cursor"], str):
+            ref.bad("cursor must be a string")
         if payload.get("cursor"):
             ref.bad("Local synchronous reindex does not use a cursor")
     index_records(s, kind=kind, clean=clean)
@@ -410,7 +402,7 @@ def legacy_extension(s, service, method, suffix, args, query, payload, caller_gr
             if not record_visible(s, record, caller_groups):
                 raise ref.ReferenceError(403, "Record ACL does not grant access")
             s.DELETED.discard(args[0])
-            s.SEARCH_BY_ID[args[0]] = deepcopy(record)
+            s.index_current_records(ids=[args[0]])
         return 200, {"datasetRegistries": [deepcopy(record)]}
     if service == "entitlements":
         q = ref.query_values(query, {"type", "cursor", "limit"} if method == "GET" else {},
@@ -509,8 +501,7 @@ def storage_extension(s, method, suffix, args, query, payload, caller_groups):
         with s.STORE_LOCK:
             records = [deepcopy(r) for rid, r in sorted(s.RECORD_BY_ID.items())
                        if rid not in s.DELETED and (kinds is None or r["kind"] in kinds)]
-            for record in records:
-                s.SEARCH_BY_ID[record["id"]] = deepcopy(record)
+            s.index_current_records(ids=[record["id"] for record in records])
         started = now()
         status = [{"kind": kind, "totalRecords": sum(r["kind"] == kind for r in records),
                    "processedRecords": sum(r["kind"] == kind for r in records),
@@ -576,16 +567,20 @@ def storage_extension(s, method, suffix, args, query, payload, caller_groups):
 
 def handle(s, route, method, query, payload, caller_groups):
     service, suffix, args = route
+    if method == "GET" and suffix.endswith(("readiness_check", "liveness_check", "warmup", "/health")):
+        ref.query_values(query, {})
+        if service in {"indexer", "search"} and suffix.endswith("readiness_check"):
+            s.indexed_count()
+        return 200, {"status": "UP"} if service == "search" else "UP"
     with LOCK:
         if suffix.endswith("/info"):
             ref.query_values(query, {})
             spec = INVENTORY["services"][service]
             return 200, {"artifactId": "osdu-lite-" + service, "version": spec["version"],
                          "buildTime": "2026-10-28T00:00:00Z", "groupId": "org.osdu-lite",
-                         "connectedOuterServices": [], "mock": spec["capability"] == "mock"}
-        if method == "GET" and suffix.endswith(("readiness_check", "liveness_check", "warmup", "/health")):
-            ref.query_values(query, {})
-            return 200, {"status": "UP"} if service == "search" else "UP"
+                         "connectedOuterServices": [{"name": "OpenSearch", "version": "runtime-configured"}]
+                         if service == "indexer" else [],
+                         "mock": spec["capability"] == "mock"}
         if service in {"unit", "crs-catalog", "crs-converter"}:
             return 200, reference_extensions.handle(service, method, suffix, args, query, payload)
         if service == "partition":

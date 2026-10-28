@@ -34,7 +34,7 @@ class CommunityAcceptance(ServerTestCase):
         try:
             with patch.object(server.time, "sleep", side_effect=delayed), \
                     patch.object(server.threading, "Thread", side_effect=capture_thread):
-                server.index_record_later(old)
+                server.index_records_later([server.RECORD_BY_ID[old["id"]]])
                 self.assertTrue(sleeping.wait(5))
                 server.clear_state()
                 # The same public ID/version can legitimately be recreated after reset.
@@ -43,7 +43,7 @@ class CommunityAcceptance(ServerTestCase):
                 release.set()
                 threads[0].join(5)
                 self.assertFalse(threads[0].is_alive())
-                self.assertNotIn(old["id"], server.SEARCH_BY_ID)
+                self.assertNotIn(old["id"], server.SEARCH_BACKEND.documents)
         finally:
             release.set()
             for thread in threads:
@@ -117,9 +117,9 @@ class CommunityAcceptance(ServerTestCase):
         endpoint = "/api/indexer/v2"
         self.assertEqual(call("post", endpoint + "/reindex/records", {"recordIds": [record["id"]]})[0], 404)
         self.assertEqual(call("patch", endpoint + "/reindex?force_clean=true")[0], 200)
-        self.assertFalse(server.SEARCH_BY_ID)
+        self.assertFalse(server.SEARCH_BACKEND.documents)
         self.assertEqual(call("post", endpoint + "/reindex", {"kind": server.WELL_KIND})[0], 200)
-        self.assertFalse(server.SEARCH_BY_ID)
+        self.assertFalse(server.SEARCH_BACKEND.documents)
         for query in ["force_clean=maybe", "force_clean=true&force_clean=false"]:
             self.assertEqual(call("patch", endpoint + "/reindex?" + query)[0], 400)
         self.assertEqual(call("post", endpoint + "/reindex/records", {"recordIds": ["x"] * 1001})[0], 400)

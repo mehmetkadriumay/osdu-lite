@@ -8,6 +8,20 @@ jobs:
   server:
     name: Server (tests + smoke)
     runs-on: ubuntu-latest
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:3.9.0
+        env:
+          discovery.type: single-node
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+          node.store.allow_mmap: "false"
+        ports:
+          - 127.0.0.1:9200:9200
+        options: >-
+          --health-cmd "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s'"
+          --health-interval 5s --health-timeout 3s --health-retries 30
     steps:
       - uses: actions/checkout@v4
 
@@ -21,13 +35,18 @@ jobs:
 
       - name: Syntax checks
         run: |
-          python -m py_compile server/server.py server/reference_services.py server/reference_extensions.py server/community_services.py server/community-smoke-test.py server/tests/test_reference_services.py server/tests/test_community_services.py
+          python -m py_compile server/server.py server/search_backend.py server/reference_services.py server/reference_extensions.py server/community_services.py server/community-smoke-test.py server/tests/test_reference_services.py server/tests/test_community_services.py
           for f in demo-all.sh examples/well360/demo/*.sh server/*.sh examples/well360/client/*.sh; do
             bash -n "$f" || exit 1
           done
 
       - name: Unit tests
         run: python -m unittest discover -s server/tests -v
+
+      - name: Real OpenSearch and public Indexer integration
+        env:
+          OPENSEARCH_TEST_URL: http://localhost:9200
+        run: python -m unittest discover -s server/tests -p test_opensearch_integration.py -v
 
       - name: Live smoke test
         run: |

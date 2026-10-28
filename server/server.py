@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import reference_services
 import community_services
+from search_backend import OpenSearch, BackendError
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data"))
@@ -52,7 +53,9 @@ GROUPS_BY_TOKEN = {TOKEN: set(GROUPS_ALL)} if TOKEN else {}
 STORE_LOCK = threading.RLock()
 STATE_GENERATION = 0
 RECORD_BY_ID = {}
-SEARCH_BY_ID = {}
+SEARCH_BACKEND = OpenSearch(os.getenv("OPENSEARCH_URL", "http://localhost:9200"), PARTITION)
+INDEX_ERROR = None
+INDEX_KIND_GENERATION = {}
 UPLOAD_TOKENS = {}
 FILE_META = {}
 CURSORS = {}
@@ -228,13 +231,21 @@ def build_full_sample_records():
 FULL_SAMPLE = build_full_sample_records()
 
 def clear_state():
-    global STATE_GENERATION
+    global STATE_GENERATION, INDEX_ERROR
     with STORE_LOCK:
         STATE_GENERATION += 1
+        try:
+            SEARCH_BACKEND.reset()
+        except BackendError as exc:
+            INDEX_ERROR = exc
+            raise
+        INDEX_ERROR = None
+        INDEX_KIND_GENERATION.clear()
         RECORD_BY_ID.clear()
-        SEARCH_BY_ID.clear()
         UPLOAD_TOKENS.clear()
         RECORD_VERSIONS.clear()
+        DELETED.clear()
+        RECORD_TS.clear()
     with CURSOR_LOCK:
         CURSORS.clear()
     with WORKFLOW_LOCK:
@@ -246,10 +257,8 @@ def clear_state():
         GROUPS.update(seed_groups())
     LEGAL_TAGS.clear()
     LEGAL_TAGS[LEGAL_TAG] = default_legal_tag()
-    DELETED.clear()
     REVOKED_URLS.clear()
     SCHEMAS.clear()
-    RECORD_TS.clear()
     community_services.reset(PARTITION)
 
 def iso_to_epoch(value):
@@ -318,48 +327,65 @@ def validate_record(rec):
         if not is_legal_tag_valid(tag):
             raise ValueError(f"Record {rid}: LegalTag '{tag}' is not valid (expired)")
 
-def index_record_later(record):
-    rid = record["id"]
-    snapshot = deepcopy(record)
+def index_records_later(records):
     with STORE_LOCK:
         generation = STATE_GENERATION
+        snapshots = [(record, deepcopy(record), INDEX_KIND_GENERATION.get(record["kind"], 0))
+                     for record in records]
+        delay = INDEX_DELAY_SECONDS
     def apply():
-        time.sleep(INDEX_DELAY_SECONDS)
+        global INDEX_ERROR
+        time.sleep(delay)
         with STORE_LOCK:
-            # only index if the stored record is still exactly the one we indexed
-            current = RECORD_BY_ID.get(rid)
-            if (generation == STATE_GENERATION and current
-                    and current.get("version") == snapshot.get("version") and rid not in DELETED):
-                SEARCH_BY_ID[rid] = snapshot
+            if generation != STATE_GENERATION:
+                return
+            selected = [snapshot for record, snapshot, epoch in snapshots
+                        if RECORD_BY_ID.get(snapshot["id"]) is record
+                        and epoch == INDEX_KIND_GENERATION.get(snapshot["kind"], 0)
+                        and record.get("version") == snapshot.get("version")
+                        and snapshot["id"] not in DELETED]
+            if selected:
+                try:
+                    ensure_index()
+                    SEARCH_BACKEND.bulk(selected)
+                except BackendError as exc:
+                    INDEX_ERROR = exc
     threading.Thread(target=apply, daemon=True).start()
 
 def upsert_records(records, index_immediately=False):
     out = []
+    pending = []
     now = time.time()
     with STORE_LOCK:
-        for incoming in records:
-            rec = deepcopy(incoming)
-            validate_record(rec)
-            rid = rec["id"]
-            old = RECORD_BY_ID.get(rid)
-            version = int(old.get("version", 0)) + 1 if old else int(rec.get("version", 1) or 1)
-            rec["version"] = version
-            RECORD_BY_ID[rid] = rec
-            RECORD_VERSIONS.setdefault(rid, []).append({
-                "version": version,
-                "record": deepcopy(rec),
-                "timestamp": now,
-            })
-            ts = RECORD_TS.setdefault(rid, {})
-            if "createTime" not in ts:
-                ts["createTime"] = now
-            ts["modify"] = now
-            DELETED.discard(rid)
-            out.append({"id": rid, "version": version})
-            if index_immediately:
-                SEARCH_BY_ID[rid] = deepcopy(rec)
-            else:
-                index_record_later(rec)
+        try:
+            for incoming in records:
+                rec = deepcopy(incoming)
+                validate_record(rec)
+                rid = rec["id"]
+                old = RECORD_BY_ID.get(rid)
+                version = int(old.get("version", 0)) + 1 if old else int(rec.get("version", 1) or 1)
+                rec["version"] = version
+                RECORD_BY_ID[rid] = rec
+                RECORD_VERSIONS.setdefault(rid, []).append({
+                    "version": version,
+                    "record": deepcopy(rec),
+                    "timestamp": now,
+                })
+                ts = RECORD_TS.setdefault(rid, {})
+                if "createTime" not in ts:
+                    ts["createTime"] = now
+                ts["modify"] = now
+                DELETED.discard(rid)
+                out.append({"id": rid, "version": version})
+                pending.append(rec)
+        finally:
+            # Preserve indexing of accepted records even if a later record in
+            # this non-transactional Storage batch fails validation.
+            if pending:
+                if index_immediately:
+                    index_current_records([item["id"] for item in out])
+                else:
+                    index_records_later(pending)
     return out
 
 def soft_delete_records(record_ids):
@@ -368,7 +394,7 @@ def soft_delete_records(record_ids):
         for rid in record_ids:
             if rid in RECORD_BY_ID:
                 DELETED.add(rid)
-                SEARCH_BY_ID.pop(rid, None)
+                delete_index_record(rid)
                 removed.append(rid)
     return removed
 
@@ -395,8 +421,10 @@ def storage_records_snapshot(kind, deleted_only, modify_after_epoch, descending)
     return out
 
 def load_full_sample(index_immediately=True):
-    clear_state()
-    upsert_records(FULL_SAMPLE, index_immediately=index_immediately)
+    # Community dispatch also takes these locks in this order.
+    with community_services.LOCK, STORE_LOCK:
+        clear_state()
+        upsert_records(FULL_SAMPLE, index_immediately=index_immediately)
 
 def record_counts():
     with STORE_LOCK:
@@ -455,242 +483,70 @@ def kind_matches(pattern, kind):
         return any(kind_matches(x, kind) for x in pattern)
     return fnmatch.fnmatch(kind.lower(), str(pattern).lower())
 
-def _compare(a, b):
+def index_current_records(ids=None, kind=None, clean=False):
+    """Synchronous writers select authoritative Storage under its lock."""
+    global INDEX_ERROR
+    with STORE_LOCK:
+        ensure_index()
+        selected = [deepcopy(record) for rid, record in sorted(RECORD_BY_ID.items())
+                    if rid not in DELETED and (ids is None or rid in ids)
+                    and (kind is None or kind_matches(kind, record["kind"]))]
+        try:
+            if clean:
+                if kind is None:
+                    SEARCH_BACKEND.reset()
+                else:
+                    SEARCH_BACKEND.delete_kind(kind, pattern=True)
+            SEARCH_BACKEND.bulk(selected)
+        except BackendError as exc:
+            INDEX_ERROR = exc
+            raise
+        return selected
+
+def delete_index_record(rid):
+    global INDEX_ERROR
     try:
-        return (float(a) > float(b)) - (float(a) < float(b))
-    except (TypeError, ValueError):
-        return (str(a) > str(b)) - (str(a) < str(b))
+        SEARCH_BACKEND.delete(rid)
+    except BackendError as exc:
+        INDEX_ERROR = exc
+        raise
 
-def _in_range(value, lo, hi):
-    if lo is not None and _compare(value, lo) < 0:
-        return False
-    if hi is not None and _compare(value, hi) > 0:
-        return False
-    return True
+def delete_index_kind(kind):
+    global INDEX_ERROR
+    with STORE_LOCK:
+        ensure_index()
+        INDEX_KIND_GENERATION[kind] = INDEX_KIND_GENERATION.get(kind, 0) + 1
+        try:
+            SEARCH_BACKEND.delete_kind(kind)
+        except BackendError as exc:
+            INDEX_ERROR = exc
+            raise
 
-class MatchStar:
-    def __call__(self, record):
-        return True
+def ensure_index():
+    global INDEX_ERROR
+    with STORE_LOCK:
+        try:
+            if INDEX_ERROR is not None or SEARCH_BACKEND.provision():
+                INDEX_ERROR = BackendError(503, "OpenSearch index requires Storage reconciliation")
+                SEARCH_BACKEND.reset()
+                SEARCH_BACKEND.bulk([deepcopy(r) for rid, r in RECORD_BY_ID.items() if rid not in DELETED])
+                INDEX_ERROR = None
+        except BackendError as exc:
+            INDEX_ERROR = exc
+            raise
 
-class FieldMatch:
-    def __init__(self, field, expected):
-        self.field = field
-        self.expected = expected
-    def __call__(self, record):
-        actual = get_path(record, self.field)
-        if isinstance(actual, list):
-            return any(fnmatch.fnmatch(str(x), self.expected) for x in actual)
-        if actual is None:
-            return False
-        return fnmatch.fnmatch(str(actual), self.expected)
+def indexed_count():
+    with STORE_LOCK:
+        ensure_index()
+        return SEARCH_BACKEND.count()
 
-class RangeMatch:
-    def __init__(self, field, lo, hi):
-        self.field = field
-        self.lo = lo
-        self.hi = hi
-    def __call__(self, record):
-        actual = get_path(record, self.field)
-        vals = actual if isinstance(actual, list) else [actual]
-        return any(_in_range(v, self.lo, self.hi) for v in vals if v is not None)
-
-class SubstringMatch:
-    def __init__(self, text):
-        self.text = text
-    def __call__(self, record):
-        return self.text.lower() in json.dumps(record).lower()
-
-class And:
-    def __init__(self, left, right):
-        self.left = left
-        self.right = right
-    def __call__(self, record):
-        return self.left(record) and self.right(record)
-
-class Or:
-    def __init__(self, left, right):
-        self.left = left
-        self.right = right
-    def __call__(self, record):
-        return self.left(record) or self.right(record)
-
-class Not:
-    def __init__(self, child):
-        self.child = child
-    def __call__(self, record):
-        return not self.child(record)
-
-class QueryParser:
-    def __init__(self, text):
-        self.tokens = self._tokenize(text)
-        self.pos = 0
-
-    @staticmethod
-    def _tokenize(text):
-        out = []
-        i = 0
-        n = len(text)
-        while i < n:
-            c = text[i]
-            if c.isspace():
-                i += 1
-                continue
-            if c in "()[]:*":
-                out.append(("PUNCT", c))
-                i += 1
-                continue
-            if c == '"':
-                j = text.find('"', i + 1)
-                if j < 0:
-                    raise ValueError("Unterminated quoted value")
-                out.append(("QUOTED", text[i + 1:j]))
-                i = j + 1
-                continue
-            j = i
-            while j < n and not text[j].isspace() and text[j] not in "()[]:*\"":
-                j += 1
-            out.append(("WORD", text[i:j]))
-            i = j
-        return out
-
-    def peek(self):
-        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
-
-    def _is_word(self, name):
-        tok = self.peek()
-        return isinstance(tok, tuple) and tok[0] == "WORD" and tok[1].upper() == name
-
-    def parse(self):
-        if not self.tokens:
-            return MatchStar()
-        expr = self._parse_or()
-        if self.pos != len(self.tokens):
-            raise ValueError("Trailing tokens in query")
-        return expr
-
-    def _parse_or(self):
-        left = self._parse_and()
-        while self._is_word("OR"):
-            self.pos += 1
-            right = self._parse_and()
-            left = Or(left, right)
-        return left
-
-    def _parse_and(self):
-        left = self._parse_unary()
-        while True:
-            if self._is_word("OR"):
-                break
-            if self._is_word("AND"):
-                self.pos += 1
-                right = self._parse_unary()
-                left = And(left, right)
-            elif self._starts_term():
-                right = self._parse_unary()
-                left = And(left, right)
-            else:
-                break
-        return left
-
-    def _starts_term(self):
-        tok = self.peek()
-        if tok is None:
-            return False
-        if isinstance(tok, tuple):
-            return tok[0] in ("WORD", "QUOTED")
-        return tok[1] in "(*"
-
-    def _parse_unary(self):
-        if self._is_word("NOT"):
-            self.pos += 1
-            return Not(self._parse_unary())
-        return self._parse_primary()
-
-    def _parse_primary(self):
-        tok = self.peek()
-        if tok == ("PUNCT", "("):
-            self.pos += 1
-            expr = self._parse_or()
-            if self.peek() != ("PUNCT", ")"):
-                raise ValueError("Unbalanced parentheses")
-            self.pos += 1
-            return expr
-        tok = self.next()
-        if isinstance(tok, tuple) and tok[0] in ("WORD", "QUOTED"):
-            field = tok[1]
-            if self.peek() == ("PUNCT", ":"):
-                self.pos += 1
-                return self._parse_value(field)
-            return SubstringMatch(field)
-        raise ValueError(f"Unexpected token: {tok}")
-
-    def next(self):
-        tok = self.tokens[self.pos]
-        self.pos += 1
-        return tok
-
-    def _parse_value(self, field):
-        tok = self.peek()
-        if tok == ("PUNCT", "["):
-            self.pos += 1
-            lo = self._next_bound()
-            hi = None
-            if self._is_word("TO"):
-                self.pos += 1
-                hi = self._next_bound()
-            if self.peek() != ("PUNCT", "]"):
-                raise ValueError("Unterminated range")
-            self.pos += 1
-            return RangeMatch(field, lo, hi)
-        if tok == ("PUNCT", "*"):
-            self.pos += 1
-            return FieldMatch(field, "*")
-        if isinstance(tok, tuple) and tok[0] in ("WORD", "QUOTED"):
-            self.pos += 1
-            return FieldMatch(field, tok[1])
-        raise ValueError("Expected a value after ':'")
-
-    def _next_bound(self):
-        tok = self.peek()
-        if tok == ("PUNCT", "*"):
-            self.pos += 1
-            return None
-        if isinstance(tok, tuple) and tok[0] in ("WORD", "QUOTED"):
-            self.pos += 1
-            return tok[1]
-        raise ValueError("Expected a range bound")
-
-def matches_query(record, query):
-    if not query:
-        return True
-    q = query.strip()
-    if q == "*":
-        return True
-    try:
-        return QueryParser(q).parse()(record)
-    except Exception:
-        return q.strip('"').lower() in json.dumps(record).lower()
-
-def search_records(payload):
+def search_records(payload, caller_groups=None):
     kind = payload.get("kind")
     if not kind:
         return []
-    query = payload.get("query")
     with STORE_LOCK:
-        records = [r for r in SEARCH_BY_ID.values() if r["id"] not in DELETED]
-    found = [r for r in records if kind_matches(kind, r.get("kind", "")) and matches_query(r, query)]
-    found.sort(key=lambda r: r["id"])
-    return found
-
-def owner_filter(records, caller_groups):
-    if not caller_groups:
-        return records
-    out = []
-    for r in records:
-        owners = (r.get("acl") or {}).get("owners") or []
-        if any(g in caller_groups for g in owners):
-            out.append(r)
-    return out
+        ensure_index()
+    return SEARCH_BACKEND.search(payload, caller_groups, bool(payload.get("query_as_owner")))
 
 def _field_values(records, field):
     values = []
@@ -1034,6 +890,14 @@ scan_file_meta()
 if PRELOAD_FULL_SAMPLE:
     load_full_sample(index_immediately=True)
 
+def backend_errors(method):
+    def wrapped(self):
+        try:
+            return method(self)
+        except BackendError as exc:
+            return self._error(exc.status, str(exc))
+    return wrapped
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "OSDU-Well360/0.7"
 
@@ -1151,7 +1015,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             else:
                 self._json(status, result)
-        except reference_services.ReferenceError as exc:
+        except (reference_services.ReferenceError, BackendError) as exc:
             self._error(exc.status, str(exc))
         except Exception:
             # Do not log request data: a request may contain a mock credential.
@@ -1189,6 +1053,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
         self.end_headers()
 
+    @backend_errors
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -1202,7 +1067,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/health", "/info"}:
             with STORE_LOCK:
                 stored = len(RECORD_BY_ID)
-                indexed = len(SEARCH_BY_ID)
+                indexed = indexed_count()
             counts = record_counts()
             full_sample_loaded = is_full_sample_loaded()
             return self._json(200, {
@@ -1631,10 +1496,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in {"/api/search/v2/liveness_check", "/search/v2/liveness_check",
                     "/api/search/v2/readiness_check", "/search/v2/readiness_check"}:
+            if path.endswith("readiness_check"):
+                indexed_count()
             return self._json(200, {"status": "UP"})
 
         self._error(404, f"Unknown endpoint: {path}")
 
+    @backend_errors
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -1651,9 +1519,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/api/search/v2/query", "/search/v2/query"}:
             if not self._rbac({"service.search.user"}):
                 return
-            found = search_records(payload)
-            if payload.get("query_as_owner"):
-                found = owner_filter(found, group_for_caller(self))
+            found = search_records(payload, group_for_caller(self) if REQUIRE_AUTH else None)
             offset = max(0, int(payload.get("offset", 0)))
             limit = max(1, min(1000, int(payload.get("limit", 10))))
             page = found[offset:offset + limit]
@@ -1676,6 +1542,9 @@ class Handler(BaseHTTPRequestHandler):
                     state = CURSORS.get(cursor)
                     if not state:
                         return self._error(400, "Unknown/expired cursor")
+                    if (state.get("principal") != self.headers.get("Authorization", "")
+                            or state.get("groups") != sorted(group_for_caller(self))):
+                        return self._error(403, "Cursor does not belong to current caller entitlements")
                     found = state["results"]
                     pos = state["pos"]
                     limit = state["limit"]
@@ -1688,7 +1557,7 @@ class Handler(BaseHTTPRequestHandler):
                         "totalCount": len(found),
                         "cursor": cursor,
                     })
-            found = search_records(payload)
+            found = search_records(payload, group_for_caller(self) if REQUIRE_AUTH else None)
             limit = max(1, min(1000, int(payload.get("limit", 10))))
             fields = payload.get("returnedFields")
             cursor = "demo-" + uuid.uuid4().hex[:16]
@@ -1696,6 +1565,8 @@ class Handler(BaseHTTPRequestHandler):
             with CURSOR_LOCK:
                 CURSORS[cursor] = {
                     "results": found, "pos": limit, "limit": limit,
+                    "principal": self.headers.get("Authorization", ""),
+                    "groups": sorted(group_for_caller(self)),
                     "fields": fields, "updated": time.time()
                 }
             return self._json(200, {
@@ -2166,7 +2037,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "status": "loaded",
                 "storedRecords": len(RECORD_BY_ID),
-                "indexedRecords": len(SEARCH_BY_ID),
+                "indexedRecords": indexed_count(),
                 "currentDataProfile": current_data_profile(),
                 "preloadedFullSample": is_full_sample_loaded(),
                 **counts,
@@ -2174,6 +2045,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._error(404, f"Unknown endpoint: {path}")
 
+    @backend_errors
     def do_PUT(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -2303,6 +2175,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._error(404, f"Unknown endpoint: {path}")
 
+    @backend_errors
     def do_DELETE(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -2331,8 +2204,14 @@ class Handler(BaseHTTPRequestHandler):
 
         for prefix in ("/api/search/v2/query_with_cursor/", "/search/v2/query_with_cursor/"):
             if path.startswith(prefix):
+                if not self._rbac({"service.search.user"}):
+                    return
                 cursor = unquote(path[len(prefix):])
                 with CURSOR_LOCK:
+                    state = CURSORS.get(cursor)
+                    if state and (state.get("principal") != self.headers.get("Authorization", "")
+                                  or state.get("groups") != sorted(group_for_caller(self))):
+                        return self._error(403, "Cursor does not belong to current caller entitlements")
                     CURSORS.pop(cursor, None)
                 return self._no_content()
 
@@ -2345,10 +2224,10 @@ class Handler(BaseHTTPRequestHandler):
                     if rid not in RECORD_BY_ID and not RECORD_VERSIONS.get(rid):
                         return self._error(404, f"Record not found: {rid}")
                     RECORD_BY_ID.pop(rid, None)
-                    SEARCH_BY_ID.pop(rid, None)
                     RECORD_VERSIONS.pop(rid, None)
                     RECORD_TS.pop(rid, None)
                     DELETED.discard(rid)
+                    delete_index_record(rid)
                 return self._no_content()
 
         for prefix in ("/api/storage/v2/records/", "/storage/v2/records/"):
@@ -2362,13 +2241,13 @@ class Handler(BaseHTTPRequestHandler):
                         return self._error(404, f"Record not found: {rid}")
                     if hard:
                         RECORD_BY_ID.pop(rid, None)
-                        SEARCH_BY_ID.pop(rid, None)
                         RECORD_VERSIONS.pop(rid, None)
                         DELETED.discard(rid)
                         RECORD_TS.pop(rid, None)
+                        delete_index_record(rid)
                     else:
                         DELETED.add(rid)
-                        SEARCH_BY_ID.pop(rid, None)
+                        delete_index_record(rid)
                 return self._no_content()
 
         for prefix in ("/api/legal/v1/legaltags/", "/legal/v1/legaltags/"):
@@ -2446,6 +2325,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._error(404, f"Unknown endpoint: {path}")
 
+    @backend_errors
     def do_PATCH(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -2519,6 +2399,8 @@ class Handler(BaseHTTPRequestHandler):
         self._error(404, f"Unknown endpoint: {path}")
 
 def main():
+    if not PRELOAD_FULL_SAMPLE:
+        clear_state()
     print(f"OSDU Well 360 local server v0.7 listening on http://0.0.0.0:{PORT}")
     print(f"Partition: {PARTITION} | token: {TOKEN if REQUIRE_AUTH else '(auth disabled)'}")
     print(f"Preload full sample configured: {PRELOAD_FULL_SAMPLE} | index delay: {INDEX_DELAY_SECONDS}s")

@@ -7,11 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- Real OpenSearch 3.9.0 runtime backend, replacing the production in-memory
+  Search/parser. Partition-scoped mappings, Lucene query_string, ACL filtering,
+  complete scroll snapshots, explicit engine errors and readiness.
+- Public local Indexer v2 provision/reindex/record-reindex/kind-delete operations
+  now execute real engine writes and refresh. All mutation/replay/restore hooks
+  share the backend, with stale-task guards and asynchronous failure recovery.
+- Single-node isolated WSL-container and Compose deployment instructions,
+  explicit fake unit-test injection and separately gated real-engine CI tests.
 - Independently pinned Apache-2.0 public community extension inventory: 126
   method/path operations across 16 services, with source versions, revisions
   and SHA-256 fingerprints. This is a bounded test-double inventory, not full
   production parity or private-standard conformance.
-- Stateful in-memory Indexer, Notification, Partition, Register and Secret
+- Stateful in-memory Notification, Partition, Register and Secret
   mocks, resource/body limits, local RBAC, secret ACLs/value-free lists and
   reset isolation. No outbound callbacks or provider infrastructure.
 - Unit catalog/measurement/unit-system lookups and validated affine ABCD

@@ -1,4 +1,18 @@
 services:
+  opensearch:
+    image: opensearchproject/opensearch:3.9.0
+    environment:
+      discovery.type: single-node
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      node.store.allow_mmap: "false"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [backend]
   server:
     build: .
     container_name: osdu-well360-local
@@ -11,6 +25,11 @@ services:
       REQUIRE_AUTH: "true"
       PRELOAD_FULL_SAMPLE: "true"
       INDEX_DELAY_SECONDS: "0.7"
+      OPENSEARCH_URL: "http://opensearch:9200"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    networks: [backend, frontend]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/health', timeout=2)"]
       interval: 5s
@@ -18,3 +37,7 @@ services:
       retries: 12
       start_period: 5s
     restart: unless-stopped
+networks:
+  backend:
+    internal: true
+  frontend: {}

@@ -311,11 +311,11 @@ class ConversionTests(unittest.TestCase):
                 self.assertEqual(call("post", path, body, token="", partition="")[0], 200)
             self.assertEqual(call("post", path, " " * 1048577, raw=True)[0], 413)
             self.assertEqual(call("post", path, [], raw=False)[0], 400)
-        before = copy.deepcopy((server.RECORD_BY_ID, server.SEARCH_BY_ID, server.WORKFLOW_RUNS))
+        before = copy.deepcopy((server.RECORD_BY_ID, server.SEARCH_BACKEND.documents, server.WORKFLOW_RUNS))
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda _: call("post", CONVERT, body), range(32)))
         self.assertTrue(all(r == results[0] for r in results))
-        self.assertEqual((server.RECORD_BY_ID, server.SEARCH_BY_ID, server.WORKFLOW_RUNS), before)
+        self.assertEqual((server.RECORD_BY_ID, server.SEARCH_BACKEND.documents, server.WORKFLOW_RUNS), before)
         import reference_services
         self.assertFalse(reference_services.network.is_network_enabled())
         with patch.object(reference_services.Transformer, "from_crs", side_effect=RuntimeError("secret path")):

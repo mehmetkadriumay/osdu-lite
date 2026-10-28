@@ -1,6 +1,6 @@
 # OSDU-Lite
 
-An in-memory emulator for the OSDU service APIs, for development, demos, and CI.
+An OSDU API emulator with in-memory Storage and real OpenSearch, for development, demos, and CI.
 
 [![CI](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/ci.yml)
 [![Container image](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/publish-docker.yml/badge.svg)](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/publish-docker.yml)
@@ -10,15 +10,15 @@ Search, Dataset, File, Workflow, Legal, Schema, Entitlements, CRS, Unit, Indexer
 Notification, Partition, Register and Secret. Clients exercising the supported
 subset can point at `http://localhost:8089`; check the operation inventory and
 documented mock limitations before substituting for a real deployment.
-No cloud, OpenSearch or OIDC is required.
+One local OpenSearch node is required; no cloud or OIDC is required.
 
 This repo also contains a working integration around it - the Well 360 example
 (Well -> Wellbore -> WellLog -> Dataset -> LAS) with a Java consumer compiled
 against `os-core-common`. See [Releases and changelog](CHANGELOG.md).
 
 > Scope: this is a test double, not a deployment. It proves workflows and payload
-> shapes; it does not implement OpenSearch semantics, data-plane ACLs at scale,
-> legal blocking, or OIDC/IAM.
+> shapes and uses actual Lucene query semantics. It is not certified upstream
+> OSDU, durable Storage, data-plane ACLs at scale, legal blocking, or OIDC/IAM.
 
 ## Quickstart
 
@@ -42,8 +42,18 @@ Windows interoperability to invoke `wslc.exe` from the Linux shell; keep the
 start the published image:
 
 ```bash
+wslc.exe network create osdu-lite-net
+wslc.exe pull opensearchproject/opensearch:3.9.0
+wslc.exe run --rm -d --name osdu-lite-opensearch --network osdu-lite-net --network-alias opensearch \
+  -e discovery.type=single-node -e DISABLE_INSTALL_DEMO_CONFIG=true -e DISABLE_SECURITY_PLUGIN=true \
+  -e 'OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m' -e node.store.allow_mmap=false \
+  --health-cmd 'curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow' \
+  --health-interval 5s --health-timeout 3s --health-retries 30 opensearchproject/opensearch:3.9.0
+# Wait for the OpenSearch container to be healthy before starting the API:
+wslc.exe container list
 wslc.exe pull ghcr.io/mehmetkadriumay/osdu-lite:latest
-wslc.exe run --rm -d --name osdu-well360 -p 8089:8089 ghcr.io/mehmetkadriumay/osdu-lite:latest
+wslc.exe run --rm -d --name osdu-well360 --network osdu-lite-net -p 8089:8089 \
+  -e OPENSEARCH_URL=http://opensearch:9200 ghcr.io/mehmetkadriumay/osdu-lite:latest
 ```
 
 The API is available at **http://localhost:8089**, with 15 sample records
@@ -59,11 +69,19 @@ Manage the container from the same terminal:
 wslc.exe container list
 wslc.exe logs osdu-well360
 wslc.exe stop osdu-well360
+wslc.exe stop osdu-lite-opensearch
+wslc.exe network rm osdu-lite-net
 ```
 
-`--rm` removes the container after it stops. All data is in memory; starting a
-new container reloads the sample and discards previous changes. If the name or
-port is already in use, stop your previous instance before starting another.
+`--rm` removes each container after it stops. Storage is in memory; starting a
+new API container resets its managed partition index and reloads the sample.
+Use unique names/network if any of these names are already in use; never stop
+an unrelated instance. Reserve at least 2 GB for OpenSearch. Security is disabled
+for this private local-development bridge only: do not publish its ports or
+use this configuration in production. No global sysctl changes are needed.
+Only the API port is published. A WSLc `--internal` network cannot forward the
+API's published port by itself; Compose uses a separate frontend network for
+the API and an internal backend network for OpenSearch.
 
 `latest` tracks `main`; pushing a `v*` tag to `mehmetkadriumay/osdu-lite`
 also publishes matching versioned images. Both `amd64` and `arm64` are supported.
@@ -76,7 +94,8 @@ the Windows executable:
 
 ```bash
 wslc.exe build -t osdu-lite:local "$(wslpath -w "$PWD/server")"
-wslc.exe run --rm -d --name osdu-well360 -p 8089:8089 osdu-lite:local
+wslc.exe run --rm -d --name osdu-well360 --network osdu-lite-net -p 8089:8089 \
+  -e OPENSEARCH_URL=http://opensearch:9200 osdu-lite:local
 ```
 
 Stop any previously started `osdu-well360` container before running the local
@@ -99,7 +118,13 @@ These target `http://localhost:8089` by default. Set `OSDU_BASE_URL` if you
 published a different host port. Use `make java` to run the reference Java
 client against the same running server.
 
-### Native Python alternative (no container runtime)
+### Native Python alternative
+
+Start OpenSearch first. For a native API with a WSL-container node, use the same
+OpenSearch launch flags above but add `-p 127.0.0.1:9200:9200`. This is a
+**loopback-only development exception**, not public engine exposure. Alternatively
+use an existing local node. The API defaults to `http://localhost:9200` and fails
+startup clearly if the node is unavailable (5-second request timeout).
 
 For native development and tests, install the pinned **binary-only** runtime
 dependencies first (including pyproj 3.7.2 and certifi). Use CPython 3.11 or
@@ -110,6 +135,7 @@ python3 -m venv .venv
 source .venv/bin/activate              # Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install --only-binary=:all: --require-hashes -r server/requirements.txt
 python -m unittest discover -s server/tests -v
+OPENSEARCH_TEST_URL=http://localhost:9200 python -m unittest discover -s server/tests -p test_opensearch_integration.py -v
 python server/server.py
 ```
 
@@ -143,19 +169,21 @@ make stop
 | `OSDU_TOKEN`         | `demo-token`         | accepted bearer token                         |
 | `REQUIRE_AUTH`       | `true`               | validate `Authorization` and RBAC             |
 | `PRELOAD_FULL_SAMPLE`| `true`               | seed 15 Well 360 records on start             |
-| `INDEX_DELAY_SECONDS`| `0.7`                | simulated indexer delay before Search sees a record |
+| `INDEX_DELAY_SECONDS`| `0.7`                | local delay before real indexing and refresh |
+| `OPENSEARCH_URL`     | `http://localhost:9200` | OpenSearch origin; containers use `http://opensearch:9200` |
 
 The demo token is a member of every group, so RBAC checks (HTTP 403 on a missing
 entitlement) pass in all walkthroughs but still fail for unknown tokens.
 
 ## What is emulated
 
-All in memory; every process restart returns to a clean state.
+Storage and non-search services are in memory; every process restart resets the
+managed OpenSearch index to match that clean state.
 
 | Service      | API  | Highlights                                                          |
 | ------------ | ---- | ------------------------------------------------------------------- |
 | Storage      | v2   | PUT/GET/PATCH/DELETE, version history, copy, batch ops, kinds, cursors |
-| Search       | v2   | Lucene-style queries, cursor queries, aggregations, as-owner, health checks |
+| Search       | v2   | real Lucene query_string, cursor queries, aggregations, as-owner, health checks |
 | Dataset      | v1   | registration, storage/retrieval instructions, registry, revoke, soft delete |
 | File         | v2   | metadata, upload URLs, signed delivery, getLocation                  |
 | Workflow     | v1   | deploy/list/run lifecycle, `Osdu_ingest` manifest ingestion          |
@@ -165,7 +193,7 @@ All in memory; every process restart returns to a clean state.
 | CRS Catalog  | v3 subset | four fixed horizontal CRS entries, detail and filtered queries |
 | CRS Converter | v3 subset | offline pyproj x/y conversion, ordered batches; z retained |
 | Unit         | v3 subset | 17 fixed units, six dimensions, scale/offset coefficients |
-| Indexer      | v2 mock | synchronous reindex into existing Search, record reindex, kind index deletion |
+| Indexer      | v2 local | real OpenSearch provision, bulk reindex, record reindex, kind deletion |
 | Notification | v1 mock | validate/record incoming records-changed events; no external delivery |
 | Partition    | v1 mock | property CRUD; does not provision additional authenticated tenants |
 | Register     | v1 mock | subscriptions, secret rotation, DDMS data and exact-filter actions |
@@ -177,8 +205,8 @@ Two behaviors matter for anyone writing code against it:
   `acl` (`viewers`/`owners`), and `legal.legaltags` that exist in the Legal
   service. A record that fails validation returns 400 with the reason.
 - **Storage and Search are asynchronous.** A record is stored immediately but
-  only appears in Search after the indexer delay (0.7 s default). Search returns
-  zero for up to a second after ingest.
+  only appears in Search after the indexer delay (0.7 s default) plus the
+  actual OpenSearch write and refresh time.
 
 Retrieval instructions carry `size` and `sha256` for every known file, and the
 reference client aborts if either mismatches the downloaded LAS. Upload tokens
@@ -230,10 +258,11 @@ operations and the existing Search health routes. It is an extension coverage
 inventory, **not a count of all legacy routes or a claim of full production API
 parity**. `test_pinned_inventory_success` executes every inventory entry, checks
 its success status/envelope and observable behavior, and rejects missing coverage.
-The existing 88 baseline tests remain unchanged.
+Baseline contracts remain covered; unit tests explicitly inject an isolated fake
+backend. CI separately exercises a pinned real OpenSearch service and HTTP smokes.
 
 Each entry inherits its exact source URL, public API version, capability
-(`native` or `mock`), and SHA-256 from the service. Repository revisions pin the
+(`native`, `local-opensearch` or `mock`), and SHA-256 from the service. Repository revisions pin the
 independently verified **Apache-2.0 LICENSE** and source-only operations; live
 OpenAPI documents are independently pinned by their content hashes, not assumed
 to have been generated from those commits. Source paths and fingerprints are
@@ -290,13 +319,68 @@ Actions use exact `entityType`/`source`/`version` filters and static HTTP(S) URL
 the components are derived from a record's `authority:source:entityType:version`
 `kind`. Remote expressions and URL-template evaluation are deliberately unsupported.
 
-Indexer operations synchronously rebuild the existing in-memory Search view,
-exclude soft-deleted records, and reject unknown IDs. Storage replay is a
+Indexer operations synchronously provision/rebuild the managed OpenSearch index,
+exclude soft-deleted records, and reject unknown/deleted IDs. `POST /reindex`
+accepts a kind (wildcards supported); its optional upstream cursor is rejected
+because this local implementation completes synchronously. `PATCH /reindex`
+reindexes all kinds; `force_clean=true` removes matching kind documents before
+rebuilding. `DELETE /index?kind=...` deletes only exact-kind documents, not a
+physical/foreign index. Refresh completes before these operations return success.
+Storage replay uses the same real indexing path, but remains a
 synchronous mock job with completed per-kind status, not a cloud queue/event
 replay. Historical version purge accepts `versionIds` or `from`/`limit`, and
 refuses to delete the latest version. File revoke invalidates the local mock
 storage account's outstanding upload grants; it is not cloud signed-URL
 cryptography or revocation of already downloaded files.
+
+### OpenSearch behavior and limits
+
+The official image is pinned to **3.9.0** (published image manifest
+`sha256:3b55f6b6249cfdb92b52ee59adc8a266203ba9ef9f5d82544fad6f1af2f3609e`),
+as listed in the [official Docker guide](https://docs.opensearch.org/latest/install-and-configure/install-opensearch/docker/).
+GHCR publishes only the Python API image; it consumes this separate official
+engine image. No Dashboards, Kafka, Java Indexer deployment or cloud messaging
+is involved.
+
+One index named `osdu-lite-<32 hex SHA-256 characters of OSDU_PARTITION>` is owned
+by the configured API. Startup/reset deletes **only that exact index**. Do not
+run multiple API processes with the same partition against one node: their
+ephemeral Storage would disagree. No foreign or wildcard index deletion occurs.
+
+Queries go unchanged to OpenSearch `query_string`; empty/`*` becomes `match_all`.
+Malformed Lucene syntax returns 400, never substring fallback. Standard text
+analysis means `data.FacilityName:"EAGLE-01"` is an analyzed phrase, not Python
+whole-value equality; use `data.FacilityName.keyword:"EAGLE-01"` for exact values.
+IDs, kinds and ACLs are keyword fields; data strings have text and `.keyword`
+fields. Sample depth/coordinate fields are numeric and `data.SpudDate` is a
+date. Other values use dynamic types with automatic date detection disabled.
+Heterogeneous kinds with incompatible types for the same path will fail indexing
+explicitly (503); normalize input rather than expecting per-kind mappings.
+
+Kind and viewer/owner ACL filters run in OpenSearch **before** totals, paging and
+aggregations; `query_as_owner` restricts to owners. Auth-disabled mode is a local
+bypass. Results retain stable ID order, not relevance order (boosts are parsed
+but do not change that order). The adapter exhausts a 500-document scroll,
+clears engine scroll resources, and materializes all authorized matches for the
+existing Python pagination/aggregation and expiring cursor snapshot contracts.
+This intentionally scales with matched data, not for unbounded production
+datasets. Cursor snapshots are caller-and-entitlement-bound and may retain
+records changed/deleted after snapshot creation until expiry.
+
+Delayed writes use a generation/version guard under the Storage lock; reset,
+newer versions and deletes cannot be undone by stale tasks. Engine refresh
+completes after each indexing operation (the delay is 0.7 seconds **plus actual
+transport time**, not a visibility guess). All synchronous mutation hooks,
+dataset restore and Storage replay use the same backend. Failed asynchronous
+writes are retained as an index error: the next search/readiness check rebuilds
+from current Storage, or returns 503 if recovery fails. Bulk item failures are
+checked even on HTTP 200; no successful-empty-search fallback exists. Storage
+may already contain a write when indexing fails; reindex/recovery is authoritative.
+Missing managed indexes are recreated with explicit mappings and rebuilt from
+Storage before reads or writes, including delayed writes.
+Transport requests time out after 5 seconds and index actions are serialized
+under the local Storage lock. Startup is fail-fast; runtime liveness remains
+independent, while `/health` and Search/Indexer readiness require the backend.
 
 **Reference extensions.** The 17 units and four CRSs do not inflate the 15 seeded
 Storage records. Unit POST lookups resolve existing essences, not create new
@@ -542,7 +626,7 @@ Desktop. Wheel availability alone does not establish that either image works.
 | GET    | `/api/search/v2/readiness_check`       |                   |
 
 `POST /api/search/v2/query` supports `offset`, `limit` (max 1000),
-`returnedFields`, `kind` (fnmatch patterns), `query` (Lucene-style `AND`/`OR`/
+`returnedFields`, `kind` (OpenSearch keyword wildcard patterns), `query` (Lucene `AND`/`OR`/
 `NOT`, quoted fields, `[a TO b]` ranges, parentheses), `trackTotalCount` (false
 omits `totalCount`), `query_as_owner` (only records the caller owns), and
 `aggregateBy` with `count`, `filteredTerms`, and `histogram` aggregations.
