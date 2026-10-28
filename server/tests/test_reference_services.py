@@ -198,5 +198,131 @@ class ReferenceHTTPTests(unittest.TestCase):
                 self.assertEqual(headers["correlation-id"], "reference-test")
 
 
+def crs_reference(code):
+    status, body = call("post", CATALOG, {"code": str(code)})
+    if status != 200:
+        raise AssertionError((status, body))
+    return body["searchResults"]["results"][0]["data"]["PersistableReference"]
+
+
+def conversion_body(source=4326, target=3857, points=None):
+    return {"fromCRS": crs_reference(source), "toCRS": crs_reference(target),
+            "points": [{"x": 10, "y": 20, "z": 123.45}] if points is None else points}
+
+
+class ConversionTests(unittest.TestCase):
+    def test_golden_vectors_roundtrip_axis_and_z(self):
+        for code, x, y, expected_x, expected_y in [
+            (3857, 0, 0, 0, 0),
+            (3857, 10, 20, 1113194.9079327357, 2273030.9269876895),
+            (32638, 45, 0, 500000, 0), (32639, 51, 0, 500000, 0),
+        ]:
+            with self.subTest(code=code, x=x, y=y):
+                request = conversion_body(4326, code, [{"x": x, "y": y, "z": "123.45"}])
+                before = copy.deepcopy(request)
+                status, result = call("post", CONVERT, request)
+                self.assertEqual(status, 200)
+                self.assertEqual(result["successCount"], "1")
+                point = result["points"][0]
+                self.assertAlmostEqual(float(point["x"]), expected_x, delta=1e-6)
+                self.assertAlmostEqual(float(point["y"]), expected_y, delta=1e-6)
+                self.assertEqual(float(point["z"]), 123.45)
+                self.assertTrue(all(isinstance(v, str) for v in point.values()))
+                self.assertTrue(result["operationsApplied"])
+                reverse = call("post", CONVERT, conversion_body(code, 4326, [point]))[1]["points"][0]
+                self.assertAlmostEqual(float(reverse["x"]), x, delta=1e-8)
+                self.assertAlmostEqual(float(reverse["y"]), y, delta=1e-8)
+                self.assertEqual(request, before)
+
+    def test_ordered_domain_failures_and_limits(self):
+        failed = FIXTURE["decisions"]["failedPoint"]
+        points = [{"x": 10, "y": 20, "z": 0}, {"x": 10, "y": 86, "z": 3},
+                  {"x": 0, "y": 0, "z": 9007199254740993}]
+        result = call("post", CONVERT, conversion_body(points=points))[1]
+        self.assertEqual(result["successCount"], "2")
+        self.assertEqual(len(result["points"]), 3)
+        self.assertEqual(result["points"][1], failed)
+        self.assertEqual(result["points"][2]["z"], "9007199254740993")
+        for source, target, x, y in [
+            (4326, 4326, 181, 0), (4326, 4326, 0, 91), (4326, 3857, 0, -86),
+            (4326, 32638, 41.9, 0), (4326, 32638, 45, -1), (4326, 32638, 45, 84.1),
+            (4326, 32639, 47.9, 0), (3857, 4326, 40075016.68557849, 0),
+            (3857, 4326, 0, 1e308), (32638, 4326, -1e8, -1e8),
+        ]:
+            request = conversion_body(source, target, [{"x": x, "y": y, "z": 0}])
+            status, body = call("post", CONVERT, request)
+            self.assertEqual(status, 200, request)
+            self.assertEqual(body["points"], [failed], request)
+            self.assertEqual(body["successCount"], "0")
+            self.assertEqual(body["operationsApplied"], [])
+        for code, x, y in [(3857, 180, 85.0511287798066), (3857, -180, -85.0511287798066),
+                            (32638, 42, 0), (32638, 48, 84), (32639, 48, 0), (32639, 54, 84)]:
+            body = call("post", CONVERT, conversion_body(4326, code, [{"x": x, "y": y, "z": 0}]))[1]
+            self.assertEqual(body["successCount"], "1", (code, x, y, body))
+            self.assertEqual(call("post", CONVERT, conversion_body(code, 4326, body["points"]))[1]["successCount"], "1")
+        point = {"x": 0, "y": 0, "z": 0}
+        for size, expected in [(0, 400), (1000, 200), (1001, 400)]:
+            self.assertEqual(call("post", CONVERT, conversion_body(points=[point] * size))[0], expected)
+
+    def test_rejects_malformed_and_nonfinite_coordinates(self):
+        for value in [True, False, None, "NaN", "Infinity", "", " 1", "1.2m", "01", [], {},
+                      float("nan"), float("inf"), -float("inf"), 10 ** 400, "1e9999"]:
+            for axis in ["x", "y", "z"]:
+                point = {"x": 10, "y": 20, "z": 0, axis: value}
+                status, body = call("post", CONVERT, conversion_body(points=[point]))
+                self.assertEqual(status, 400, (axis, value, body))
+                self.assertIn("message", body)
+        for points in [None, {}, [None], [[1, 2, 3]], [{"x": 1, "y": 2}],
+                       [{"x": 1, "y": 2, "z": 0, "w": 1}]]:
+            body = conversion_body()
+            body["points"] = points
+            self.assertEqual(call("post", CONVERT, body)[0], 400)
+        body = conversion_body(points=[{"x": "1e1", "y": "2e1", "z": "-0.00"}])
+        self.assertEqual(call("post", CONVERT, body)[1]["successCount"], "1")
+
+    def test_allowlist_and_integrity(self):
+        reference = json.loads(crs_reference(4326))
+        invalid = ["EPSG:4326", "osdu:reference-data--CoordinateReferenceSystem:Geographic2D:EPSG::4326:",
+                   "+proj=longlat", None, {}, json.dumps({**reference, "type": "EBC"}),
+                   json.dumps({**reference, "wkt": "EPSG:3857"}),
+                   json.dumps({**reference, "extra": 1}),
+                   json.dumps({**reference, "authCode": {"auth": "EPSG", "code": "4979"}})]
+        for field in ["fromCRS", "toCRS"]:
+            for value in invalid:
+                body = conversion_body()
+                body[field] = value
+                self.assertEqual(call("post", CONVERT, body)[0], 400)
+        body = conversion_body()
+        body["fromCRS"] = json.dumps(reference, sort_keys=True, indent=2)
+        self.assertEqual(call("post", CONVERT, body)[0], 200)
+        for body in [{}, {**conversion_body(), "unitZ": "m"}]:
+            self.assertEqual(call("post", CONVERT, body)[0], 400)
+
+    def test_route_security_limits_isolation_and_engine_error(self):
+        body = conversion_body()
+        for path in [CONVERT, CONVERT[4:]]:
+            self.assertEqual(call("post", path, body)[0], 200)
+            self.assertEqual(call("post", path, body, token="")[0], 401)
+            self.assertEqual(call("post", path, body, token="wrong")[0], 401)
+            self.assertEqual(call("post", path, body, partition="wrong")[0], 400)
+            with patch.dict(server.GROUPS_BY_TOKEN, {server.TOKEN: set()}):
+                self.assertEqual(call("post", path, body)[0], 403)
+            with patch.object(server, "REQUIRE_AUTH", False):
+                self.assertEqual(call("post", path, body, token="", partition="")[0], 200)
+            self.assertEqual(call("post", path, " " * 1048577, raw=True)[0], 413)
+            self.assertEqual(call("post", path, [], raw=False)[0], 400)
+        before = copy.deepcopy((server.RECORD_BY_ID, server.SEARCH_BY_ID, server.WORKFLOW_RUNS))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: call("post", CONVERT, body), range(32)))
+        self.assertTrue(all(r == results[0] for r in results))
+        self.assertEqual((server.RECORD_BY_ID, server.SEARCH_BY_ID, server.WORKFLOW_RUNS), before)
+        import reference_services
+        self.assertFalse(reference_services.network.is_network_enabled())
+        with patch.object(reference_services.Transformer, "from_crs", side_effect=RuntimeError("secret path")):
+            status, response = call("post", CONVERT, body)
+            self.assertEqual(status, 500)
+            self.assertNotIn("secret", json.dumps(response))
+
+
 if __name__ == "__main__":
     unittest.main()

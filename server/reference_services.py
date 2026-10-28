@@ -7,16 +7,19 @@ from copy import deepcopy
 from pathlib import Path
 
 os.environ["PROJ_NETWORK"] = "OFF"
-from pyproj import CRS, network  # noqa: E402
+from pyproj import CRS, Transformer, network  # noqa: E402
+from pyproj.exceptions import ProjError  # noqa: E402
 
 network.set_network_enabled(False)
 
 MAX_BODY = 1024 * 1024
 CATALOG_PATH = "/crs/catalog/v3/coordinate-reference-system"
+CONVERTER_PATH = "/crs/converter/v3/convert"
 UNIT_PATH = "/unit/v3"
 CATALOG_GROUP = "osdu-lite.crs.catalog.user"
 UNIT_GROUP = "osdu-lite.unit.user"
-GROUPS = {CATALOG_GROUP, UNIT_GROUP}
+CONVERTER_GROUP = "osdu-lite.crs.converter.user"
+GROUPS = {CATALOG_GROUP, UNIT_GROUP, CONVERTER_GROUP}
 _SOURCE = json.loads((Path(__file__).parent / "data/reference_catalog.json").read_text())
 
 
@@ -302,10 +305,84 @@ def unit_get(path, query):
     return _conversion(_lookup(q["fromSymbol"]), _lookup(q["toSymbol"]))
 
 
+def _resolve_crs(value, label):
+    reference = strict_json(text(value, label))
+    for record in _CRS:
+        if reference == json.loads(record["data"]["PersistableReference"]):
+            return record["data"]["Code"]
+    bad(label + " must be an unmodified persistable reference from this catalog")
+
+
+def _transformer(source, target):
+    # Only codes resolved from the fixed catalog ever reach PROJ.
+    return Transformer.from_crs("EPSG:" + source, "EPSG:" + target,
+                                always_xy=True, allow_ballpark=False, only_best=True)
+
+
+def _in_domain(code, longitude, latitude):
+    entry = next(e for e in _SOURCE["crs"] if e["code"] == code)
+    west, south, east, north = entry["extent"]
+    # Inverse floating-point noise at a boundary is not geographic extrapolation.
+    epsilon = 1e-10
+    return (math.isfinite(longitude) and math.isfinite(latitude)
+            and west - epsilon <= longitude <= east + epsilon
+            and south - epsilon <= latitude <= north + epsilon)
+
+
+def convert_points(payload):
+    object_fields(payload, {"fromCRS", "toCRS", "points"}, "conversion request")
+    source = _resolve_crs(payload.get("fromCRS"), "fromCRS")
+    target = _resolve_crs(payload.get("toCRS"), "toCRS")
+    points = payload.get("points")
+    if not isinstance(points, list) or not 1 <= len(points) <= 1000:
+        bad("points must be an array of 1 through 1000 points")
+    validated = []
+    for index, point in enumerate(points):
+        label = "points[" + str(index) + "]"
+        object_fields(point, {"x", "y", "z"}, label)
+        coordinates = [finite(point.get(axis), label + "." + axis, strings=True) for axis in ("x", "y", "z")]
+        # z is validated but never sent through a geodetic/vertical operation.
+        validated.append((coordinates[0], coordinates[1], str(point["z"])))
+
+    network.set_network_enabled(False)  # Also applies to request-thread PROJ contexts.
+    transformer = _transformer(source, target)
+    inverse = _transformer(source, "4326")
+    forward = _transformer("4326", source)
+    results = []
+    success = 0
+    for x, y, z in validated:
+        try:
+            lon, lat = inverse.transform(x, y, errcheck=True)
+            applicable = _in_domain(source, lon, lat) and _in_domain(target, lon, lat)
+            if source == "4326":
+                # Never wrap or clamp geographic input, including at the poles.
+                applicable = applicable and -180 <= x <= 180 and -90 <= y <= 90
+            elif applicable:
+                # Reject projected coordinates that PROJ can wrap onto the globe.
+                rx, ry = forward.transform(lon, lat, errcheck=True)
+                applicable = math.isclose(x, rx, rel_tol=1e-12, abs_tol=1e-6) and math.isclose(
+                    y, ry, rel_tol=1e-12, abs_tol=1e-6)
+            if applicable:
+                tx, ty = transformer.transform(x, y, errcheck=True)
+                applicable = math.isfinite(tx) and math.isfinite(ty)
+            if applicable:
+                results.append({"x": str(tx), "y": str(ty), "z": z})
+                success += 1
+                continue
+        except ProjError:
+            # Well-formed coordinates outside the engine's projection domain.
+            pass
+        results.append({"x": "NaN", "y": "NaN", "z": "NaN"})
+    return {"points": results, "successCount": str(success),
+            "operationsApplied": [transformer.description] if success else []}
+
+
 def route_group(method, path):
     path = path[4:] if path.startswith("/api/") else path
     if path == CATALOG_PATH and method in {"GET", "POST"}:
         return CATALOG_GROUP
+    if path == CONVERTER_PATH and method == "POST":
+        return CONVERTER_GROUP
     if path.startswith(UNIT_PATH + "/"):
         suffix = path[len(UNIT_PATH):]
         if (method == "GET" and suffix in {"/unit", "/unit/symbol", "/unit/measurement",
@@ -319,6 +396,8 @@ def handle(method, path, query, payload=None):
     path = path[4:] if path.startswith("/api/") else path
     if method == "POST":
         query_values(query, {})
+        if path == CONVERTER_PATH:
+            return convert_points(payload)
         return catalog_query(payload) if path == CATALOG_PATH else unit_post(payload)
     if path == CATALOG_PATH:
         return catalog_detail(query)
