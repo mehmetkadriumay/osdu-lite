@@ -1,0 +1,35 @@
+{
+  "provenance": {
+    "date": "2026-10-27",
+    "description": "OSDU-Lite curated subset, not an exported official OSDU catalog.",
+    "crs": "EPSG definitions from the pinned pyproj wheel's bundled PROJ database; WKT2 generated locally. See https://epsg.org/terms-of-use.html and pyproj/PROJ bundled licenses.",
+    "units": "Explicit SI/international definitions; symbols follow the approved plan, not a verified upstream namespace. US survey foot = 1200/3937 metre, international foot = 0.3048 metre; psi = 6894.757293168361 Pa.",
+    "namespace": "osdu-lite",
+    "ancestry": "Emulator-local dimension identities; no upstream catalog identity claim."
+  },
+  "crs": [
+    {"code": "4326", "name": "WGS 84", "id": "Geographic2D:EPSG::4326", "kind": "geographic 2D", "axes": ["longitude", "latitude"], "unit": "dega", "extent": [-180, -90, 180, 90]},
+    {"code": "3857", "name": "WGS 84 / Pseudo-Mercator", "id": "Projected:EPSG::3857", "kind": "projected", "axes": ["easting", "northing"], "unit": "m", "extent": [-180, -85.0511287798066, 180, 85.0511287798066]},
+    {"code": "32638", "name": "WGS 84 / UTM zone 38N", "id": "Projected:EPSG::32638", "kind": "projected", "axes": ["easting", "northing"], "unit": "m", "extent": [42, 0, 48, 84]},
+    {"code": "32639", "name": "WGS 84 / UTM zone 39N", "id": "Projected:EPSG::32639", "kind": "projected", "axes": ["easting", "northing"], "unit": "m", "extent": [48, 0, 54, 84]}
+  ],
+  "units": [
+    {"symbol": "m", "name": "metre", "dimension": "Length", "a": 1, "b": 0},
+    {"symbol": "km", "name": "kilometre", "dimension": "Length", "a": 1000, "b": 0},
+    {"symbol": "ft", "name": "international foot", "dimension": "Length", "a": 0.3048, "b": 0},
+    {"symbol": "ft[US]", "name": "US survey foot", "dimension": "Length", "a": 0.3048006096012192, "b": 0},
+    {"symbol": "s", "name": "second", "dimension": "Time", "a": 1, "b": 0},
+    {"symbol": "ms", "name": "millisecond", "dimension": "Time", "a": 0.001, "b": 0},
+    {"symbol": "dega", "name": "degree", "dimension": "PlaneAngle", "a": 0.017453292519943295, "b": 0},
+    {"symbol": "rad", "name": "radian", "dimension": "PlaneAngle", "a": 1, "b": 0},
+    {"symbol": "Pa", "name": "pascal", "dimension": "Pressure", "a": 1, "b": 0},
+    {"symbol": "kPa", "name": "kilopascal", "dimension": "Pressure", "a": 1000, "b": 0},
+    {"symbol": "bar", "name": "bar", "dimension": "Pressure", "a": 100000, "b": 0},
+    {"symbol": "psi", "name": "pound-force per square inch", "dimension": "Pressure", "a": 6894.757293168361, "b": 0},
+    {"symbol": "K", "name": "kelvin", "dimension": "AbsoluteTemperature", "a": 1, "b": 0},
+    {"symbol": "degC", "name": "degree Celsius", "dimension": "AbsoluteTemperature", "a": 1, "b": 273.15},
+    {"symbol": "degF", "name": "degree Fahrenheit", "dimension": "AbsoluteTemperature", "a": 0.5555555555555556, "b": 255.3722222222222},
+    {"symbol": "m/s", "name": "metre per second", "dimension": "Speed", "a": 1, "b": 0},
+    {"symbol": "ft/s", "name": "international foot per second", "dimension": "Speed", "a": 0.3048, "b": 0}
+  ]
+}

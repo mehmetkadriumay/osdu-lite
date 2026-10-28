@@ -1,0 +1,56 @@
+{
+  "retrieved": "2026-10-27",
+  "approval": "All phases of inline draft-1 approved by user; unresolved upstream details explicitly treated as emulator deviations.",
+  "sources": [
+    {"url": "https://osdu-glab.msft-osdu-test.org/api/crs/catalog/api-docs/v3", "version": "3.0.0", "openapi": "3.1.0", "sha256": "ac4fa915f39fb6e2f9c5f5ee47c70dd7c111fcf7f72bd4fb35a04df0d727a7e7"},
+    {"url": "https://osdu-glab.msft-osdu-test.org/api/crs/converter/api-docs/v3", "version": "3.0.0", "openapi": "3.1.0", "sha256": "bea27b78d884b0087e816189a6b1d3793ad122a943bf16d9f212b9f78f92dd26"},
+    {"url": "https://osdu-glab.msft-osdu-test.org/api/unit/api-docs/v3", "version": "3.0.0", "openapi": "3.1.0", "sha256": "9b51fb40ecc41fe8a9576d3861d55a33e607a2d30074626a7b5b0d9c8cab8778"}
+  ],
+  "additionalEvidence": [
+    {"url": "https://community.opengroup.org/osdu/platform/system/reference/crs-catalog-service/-/raw/master/docs/tutorial/CRS_Catalog_Service.md", "revision": "1.2 (2023-08-21)", "facts": "data.ID Geographic2D:EPSG::4326; record id has osdu:reference-data--CoordinateReferenceSystem: prefix; request recordId terminates in colon; Kind geographic 2D/projected; persistable reference has authCode,name,type,ver,wkt."},
+    {"url": "https://community.opengroup.org/osdu/platform/system/reference/unit-service/-/raw/master/unit-core/src/main/java/org/opengroup/osdu/unitservice/model/ScaleOffsetImpl.java", "facts": "y=scale*(x-offset)"},
+    {"url": "https://community.opengroup.org/osdu/platform/system/reference/unit-service/-/raw/master/unit-core/src/main/java/org/opengroup/osdu/unitservice/model/UnitEssenceImpl.java", "facts": "Jackson/Gson wire name baseMeasurement (not generated interface schema baseMeasurementEssence); USO scale-offset and UM measurement types."}
+  ],
+  "operations": [
+    "GET /api/crs/catalog/v3/coordinate-reference-system",
+    "POST /api/crs/catalog/v3/coordinate-reference-system",
+    "POST /api/crs/converter/v3/convert",
+    "GET /api/unit/v3/unit",
+    "GET /api/unit/v3/unit/symbol",
+    "GET /api/unit/v3/unit/measurement",
+    "GET /api/unit/v3/measurement/list",
+    "GET /api/unit/v3/conversion/scale",
+    "POST /api/unit/v3/conversion/scale"
+  ],
+  "excluded": "All other public operations, v2, arbitrary CRS/unit definitions, datum/vertical/dynamic/grid transformations, general ABCD conversion.",
+  "decisions": {
+    "coordinates": "Accept JSON numbers and strict decimal/exponent strings, rejecting bool/null/nonfinite. Output x/y/z and successCount as strings following generated schema, despite numeric request examples.",
+    "failedPoint": {"x": "NaN", "y": "NaN", "z": "NaN"},
+    "failedPointEvidence": "String NaN is a deliberate emulator policy, NOT verified upstream runtime serialization. A malformed point fails the request; an out-of-domain point fails individually.",
+    "crsReferences": "Only JSON-serialized LBC references returned by this catalog. Exact structural match, including WKT and metadata, irrespective of JSON formatting/key order. No bare EPSG, record IDs, alternate WKT, or arbitrary definitions in convert.",
+    "crsVersion": "OSDU-Lite/pyproj-3.7.2; local WKT2 not upstream PE WKT.",
+    "catalogProjection": "Local nested projection: default id,kind,data.ID,data.Name,data.Code,data.CodeSpace,data.Kind,data.PersistableReference. returnedFields supports existing record paths only; unsupported paths fail. returnAllFields overrides returnedFields.",
+    "catalogQuery": "Local diagnostic only, never executed by Search. Exact code/ID and case-insensitive name substring; AND semantics; deterministic numeric-code order.",
+    "catalogId": "recordId requires exactly one trailing colon; dataId/id match data.ID without trailing colon. Unknown well-formed recordId/dataId gives 404.",
+    "unitNamespace": "osdu-lite only; upstream catalog namespace/symbol/ancestry metadata could not be verified. No implied acceptance of an official namespace. These are local SI-based curated definitions.",
+    "unitEssence": "USO with symbol, baseMeasurement {type:UM,ancestry}, scaleOffset to canonical basis. Only exact catalog essences accepted; supplied coefficients must be finite JSON numbers, not strings.",
+    "entitlements": ["osdu-lite.crs.catalog.user", "osdu-lite.crs.converter.user", "osdu-lite.unit.user"],
+    "entitlementEvidence": "Explicit emulator-local names; upstream role constants not established.",
+    "limits": "1 MiB new-service bodies; 1000 points; unsupported/duplicate/blank parameters rejected; old JSON handling unchanged.",
+    "compliance": "Partial community API emulation only. No OSDU Standard v1.0 compliance claim."
+  },
+  "examples": {
+    "catalogQuery": {"codeSpace": "EPSG", "code": "4326", "returnAllFields": "true"},
+    "unitLookupQuery": "namespaces=osdu-lite&symbol=ft%5BUS%5D",
+    "unitEssence": {"type": "USO", "symbol": "m", "baseMeasurement": {"type": "UM", "ancestry": "Length"}, "scaleOffset": {"scale": 1, "offset": 0}},
+    "unitConversionResponse": {"scaleOffset": {"scale": 0.3048, "offset": 0}},
+    "mercatorResponse": {"points": [{"x": "1113194.9079327357", "y": "2273030.9269876895", "z": "123.45"}], "successCount": "1"}
+  },
+  "dependencies": {
+    "metadata": "https://pypi.org/pypi/pyproj/3.7.2/json",
+    "pyproj": "3.7.2",
+    "certifi": "2026.10.19",
+    "hashes": "requirements.txt: selected CPython 3.11/3.12 Windows x64, manylinux and musllinux amd64/arm64 wheels plus universal certifi wheel. Source distributions disallowed.",
+    "runtime": "Bundled PROJ database; PROJ_NETWORK=OFF and pyproj.network.set_network_enabled(False). Actual versions recorded during validation, not inferred from wheel availability."
+  }
+}
