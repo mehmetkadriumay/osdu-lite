@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import reference_services
 import community_services
 from search_backend import OpenSearch, BackendError
+from schema_registry import SchemaRegistry, SchemaError
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data"))
@@ -51,6 +52,7 @@ community_services.reset(PARTITION)
 GROUPS_BY_TOKEN = {TOKEN: set(GROUPS_ALL)} if TOKEN else {}
 
 STORE_LOCK = threading.RLock()
+SCHEMA_REGISTRY = SchemaRegistry(lock=STORE_LOCK)
 STATE_GENERATION = 0
 RECORD_BY_ID = {}
 SEARCH_BACKEND = OpenSearch(os.getenv("OPENSEARCH_URL", "http://localhost:9200"), PARTITION)
@@ -259,6 +261,7 @@ def clear_state():
     LEGAL_TAGS[LEGAL_TAG] = default_legal_tag()
     REVOKED_URLS.clear()
     SCHEMAS.clear()
+    SCHEMA_REGISTRY.reset()
     community_services.reset(PARTITION)
 
 def iso_to_epoch(value):
@@ -309,18 +312,9 @@ def group_for_caller(handler):
     return GROUPS_BY_TOKEN.get(token, set())
 
 def validate_record(rec):
+    SCHEMA_REGISTRY.validate_record(rec)
     rid = rec.get("id")
-    kind = rec.get("kind")
-    if not rid or not kind:
-        raise ValueError("Each record requires id and kind")
-    if kind not in SUPPORTED_KINDS:
-        raise ValueError(f"Unsupported kind: {kind}")
-    acl = rec.get("acl")
-    if not isinstance(acl, dict) or not (acl.get("viewers") or acl.get("owners")):
-        raise ValueError(f"Record {rid}: missing acl.viewers / acl.owners")
     legal = rec.get("legal")
-    if not isinstance(legal, dict) or not legal.get("legaltags"):
-        raise ValueError(f"Record {rid}: missing legal.legaltags")
     for tag in legal["legaltags"]:
         if tag not in LEGAL_TAGS:
             raise ValueError(f"Record {rid}: unknown LegalTag '{tag}' (registered: {sorted(LEGAL_TAGS)})")
@@ -808,41 +802,7 @@ def legal_tags_query(payload, valid_only):
     return {"legalTags": chosen}
 
 def schema_info_for(kind):
-    with STORE_LOCK:
-        if kind in SCHEMAS:
-            return deepcopy(SCHEMAS[kind])
-    if kind not in SUPPORTED_KINDS:
-        return None
-    parts = kind.split(":")
-    version = parts[3] if len(parts) > 3 else "1.0.0"
-    major, minor = (version.split(".") + ["0", "0"])[:2]
-    try:
-        major, minor = int(major), int(minor)
-    except ValueError:
-        major, minor = 1, 0
-    return {
-        "createdBy": "osdu-lite",
-        "status": "PUBLISHED",
-        "createdAt": "2023-01-01T00:00:00.000Z",
-        "schemaInfo": {
-            "createdBy": "osdu-lite",
-            "schemaIdentity": {
-                "authority": parts[0],
-                "source": parts[1],
-                "entityType": parts[2],
-                "schemaVersionMajor": major,
-                "schemaVersionMinor": minor,
-            },
-            "created": "2023-01-01T00:00:00.000Z",
-            "status": "PUBLISHED",
-        },
-        "schema": {
-            "title": kind,
-            "type": "object",
-            "properties": {},
-        },
-        "kind": kind,
-    }
+    return SCHEMA_REGISTRY.get(kind)
 
 def dataset_registration_records(record_ids):
     out = []
@@ -894,7 +854,7 @@ def backend_errors(method):
     def wrapped(self):
         try:
             return method(self)
-        except BackendError as exc:
+        except (BackendError, SchemaError) as exc:
             return self._error(exc.status, str(exc))
     return wrapped
 
@@ -919,8 +879,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, status, message):
-        self._json(status, {"code": status, "reason": message, "message": message})
+    def _error(self, status, message, headers=None):
+        self._json(status, {"code": status, "reason": message, "message": message}, headers=headers)
 
     def _no_content(self):
         self.send_response(204)
@@ -1224,7 +1184,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in {"/api/storage/v2/query/kinds", "/storage/v2/query/kinds"}:
             limit = min(max(int(query.get("limit", [100])[0]), 1), 100)
-            return self._json(200, SUPPORTED_KINDS[:limit])
+            return self._json(200, SCHEMA_REGISTRY.kinds()[:limit])
 
         if path in {"/api/storage/v2/records", "/storage/v2/records"}:
             if not self._rbac({"service.storage.viewer"}):
@@ -1311,12 +1271,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/api/schema-service/v1/schema", "/schema-service/v1/schema"}:
             if not self._rbac({"service.storage.viewer"}):
                 return
-            infos = []
-            for kind in SUPPORTED_KINDS:
-                infos.append(schema_info_for(kind))
             with STORE_LOCK:
-                for key, payload in sorted(SCHEMAS.items()):
-                    infos.append(deepcopy(payload))
+                infos = [schema_info_for(kind) for kind in SCHEMA_REGISTRY.kinds()]
             return self._json(200, infos)
 
         for prefix in ("/api/schema-service/v1/schema/", "/schema-service/v1/schema/"):
@@ -1515,6 +1471,20 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_json()
         if payload is None:
             return
+
+        if path in {"/api/storage/v2/records", "/storage/v2/records"}:
+            if not self._rbac({"service.storage.editor"}):
+                return
+            records = payload if isinstance(payload, list) else [payload]
+            try:
+                result = upsert_records(records)
+            except ValueError as e:
+                return self._error(getattr(e, "status", 400), str(e))
+            return self._json(200, {
+                "recordCount": len(result),
+                "recordIds": result,
+                "skippedRecordIds": [],
+            })
 
         if path in {"/api/search/v2/query", "/search/v2/query"}:
             if not self._rbac({"service.search.user"}):
@@ -1848,7 +1818,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     upsert_records([rec])
                 except ValueError as e:
-                    return self._error(400, str(e))
+                    return self._error(getattr(e, "status", 400), str(e))
                 created_ids.append({"id": rid})
             return self._json(201, created_ids[0] if len(created_ids) == 1 else {"ids": created_ids})
 
@@ -1906,7 +1876,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     upsert_records([rec])
                 except ValueError as e:
-                    return self._error(400, str(e))
+                    return self._error(getattr(e, "status", 400), str(e))
                 rec_id = rec["id"]
                 fname = dataset_file_name(rec_id) or rec.get("data", {}).get("FileName")
                 meta = FILE_META.get(fname, {})
@@ -1959,7 +1929,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         result = upsert_records(records)
                     except ValueError as e:
-                        return self._error(400, str(e))
+                        return self._error(getattr(e, "status", 400), str(e))
                     run_id = "workflow-" + uuid.uuid4().hex[:12]
                     created = time.time()
                     with WORKFLOW_LOCK:
@@ -2012,14 +1982,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/api/schema-service/v1/schema", "/schema-service/v1/schema"}:
             if not self._rbac({"service.storage.editor"}):
                 return
-            key = payload.get("kind") or payload.get("schemaInfo", {}).get("schemaIdentity", {}).get("entityType")
-            if not key:
-                return self._error(400, "Schema requires kind or schemaInfo.schemaIdentity")
-            storable = deepcopy(payload)
-            storable.setdefault("kind", key)
-            with STORE_LOCK:
-                SCHEMAS[key] = storable
-            return self._json(201, storable)
+            try:
+                status, response = SCHEMA_REGISTRY.register(payload, "POST")
+            except SchemaError as e:
+                return self._error(e.status, str(e), {"Retry-After": "1"} if e.status == 429 else None)
+            return self._json(status, response)
 
         if path == "/poc/reset":
             clear_state()
@@ -2105,7 +2072,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = upsert_records(records)
             except ValueError as e:
-                return self._error(400, str(e))
+                return self._error(getattr(e, "status", 400), str(e))
             return self._json(200, {
                 "recordCount": len(result),
                 "recordIds": result,
@@ -2122,7 +2089,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = upsert_records(records)
             except ValueError as e:
-                return self._error(400, str(e))
+                return self._error(getattr(e, "status", 400), str(e))
             if is_batch:
                 ids = [entry["id"] for entry in result]
                 with STORE_LOCK:
@@ -2137,14 +2104,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/api/schema-service/v1/schema", "/schema-service/v1/schema"}:
             if not self._rbac({"service.storage.editor"}):
                 return
-            key = payload.get("kind") or payload.get("schemaInfo", {}).get("schemaIdentity", {}).get("entityType")
-            if not key:
-                return self._error(400, "Schema requires kind or schemaInfo.schemaIdentity")
-            storable = deepcopy(payload)
-            storable.setdefault("kind", key)
-            with STORE_LOCK:
-                SCHEMAS[key] = storable
-            return self._json(200, storable)
+            try:
+                status, response = SCHEMA_REGISTRY.register(payload, "PUT")
+            except SchemaError as e:
+                return self._error(e.status, str(e), {"Retry-After": "1"} if e.status == 429 else None)
+            return self._json(status, response)
 
         if path in {"/api/schema-service/v1/schemas/system", "/schema-service/v1/schemas/system",
                     "/api/schema-service/v1/schemas/system/", "/schema-service/v1/schemas/system/"}:

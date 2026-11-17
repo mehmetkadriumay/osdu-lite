@@ -7,6 +7,8 @@ COPY reference_services.py /app/reference_services.py
 COPY reference_extensions.py /app/reference_extensions.py
 COPY community_services.py /app/community_services.py
 COPY search_backend.py /app/search_backend.py
+COPY schema_registry.py /app/schema_registry.py
+COPY schemas /app/schemas
 COPY data /app/data
 COPY files /app/files
 EXPOSE 8089

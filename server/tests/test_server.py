@@ -1121,6 +1121,96 @@ class TestSchemaService(ServerTestCase):
 
     CUSTOM = "osdu:wks:master-data--DemoCustom:1.0.0"
 
+    def test_registry_lifecycle_storage_and_builtin_protection(self):
+        body = {"kind": self.CUSTOM, "schema": {"type": "object",
+                "properties": {"Value": {"type": "number"}}}}
+        for method, expected in (("post", 201), ("post", 200), ("put", 200)):
+            status, response = call(method, "/api/schema-service/v1/schema", body)
+            self.assertEqual(status, expected)
+            self.assertEqual(response["schemaInfo"]["schemaIdentity"]["schemaVersionPatch"], 0)
+        rec = valid_well()
+        rec.update(kind=self.CUSTOM, data={"Value": 1})
+        self.assertEqual(call("post", "/api/storage/v2/records", [rec])[0], 200)
+        self.assertTrue(wait_until(lambda: bool(server.search_records({"kind": self.CUSTOM}))))
+        bad = {**rec, "id": "bad", "data": {"Value": "wrong"}}
+        self.assertEqual(call("post", "/api/storage/v2/records", [bad])[0], 400)
+        self.assertNotIn("bad", server.RECORD_BY_ID)
+        self.assertEqual(call("put", "/api/schema-service/v1/schema",
+                              {**body, "status": "DEPRECATED"})[0], 200)
+        self.assertEqual(call("post", "/api/storage/v2/records", [rec])[0], 409)
+        self.assertEqual(call("get", f"/api/schema-service/v1/schema/{self.CUSTOM}")[0], 200)
+        _, listing = call("get", "/api/schema-service/v1/schema")
+        self.assertEqual(sum(s["kind"] == self.CUSTOM for s in listing), 1)
+        _, builtin = call("get", f"/api/schema-service/v1/schema/{server.WELL_KIND}")
+        self.assertEqual(call("post", "/api/schema-service/v1/schema", builtin)[0], 200)
+        builtin["schema"]["properties"]["FacilityName"] = {"type": "integer"}
+        self.assertEqual(call("put", "/api/schema-service/v1/schema", builtin)[0], 409)
+
+    def test_registry_rejects_bad_identity_and_preserves_service_roles(self):
+        for payload in ({"schemaInfo": {"schemaIdentity": {"entityType": "Only"}},
+                         "schema": {"type": "object"}},
+                        {"kind": self.CUSTOM, "schema": {"type": "object"},
+                         "schemaInfo": {"schemaIdentity": {"authority": "wrong"}}}):
+            self.assertEqual(call("post", "/api/schema-service/v1/schema", payload)[0], 400)
+        saved = server.GROUPS_BY_TOKEN[server.TOKEN]
+        server.GROUPS_BY_TOKEN[server.TOKEN] = {"service.storage.viewer"}
+        try:
+            self.assertEqual(call("post", "/api/schema-service/v1/schema",
+                                  {"kind": self.CUSTOM, "schema": {"type": "object"}})[0], 403)
+        finally:
+            server.GROUPS_BY_TOKEN[server.TOKEN] = saved
+
+    def test_all_csv_samples_and_manifest_records_validate(self):
+        root = Path(__file__).resolve().parents[2]
+        for data_dir in (root / "server/data", root / "examples/well360/reference"):
+            original = server.DATA_DIR
+            try:
+                server.DATA_DIR = data_dir
+                records = server.build_full_sample_records()
+            finally:
+                server.DATA_DIR = original
+            self.assertEqual(len(records), 15)
+            self.assertEqual(call("post", "/api/storage/v2/records", records)[0], 200)
+        for path in (root / "examples").rglob("manifest_example.json"):
+            # Render the reference guide's explicitly administrator-supplied LegalTag.
+            payload = json.loads(path.read_text().replace("<approved-legal-tag-name>", server.LEGAL_TAG))
+            records = server.manifest_records(payload)
+            self.assertEqual(len(records), 3)
+            for rec in records:
+                server.validate_record(rec)
+            self.assertEqual(call("post", "/api/storage/v2/records", records)[0], 200)
+        paths = list((root / "examples").rglob("sample_*_record.json"))
+        self.assertEqual(len(paths), 7)
+        for path in paths:
+            rec = json.loads(path.read_text().replace("<approved-legal-tag-name>", server.LEGAL_TAG))
+            status, response = call("post", "/api/storage/v2/records", rec if isinstance(rec, list) else [rec])
+            self.assertEqual(status, 200, (str(path), response))
+
+    def test_registry_capacity_returns_retry_after_without_mutation(self):
+        for i in range(28):
+            server.SCHEMA_REGISTRY.register({"kind": f"test:local:K{i}:1.0.0",
+                                            "schema": {"type": "object"}}, "POST")
+        body = json.dumps({"kind": self.CUSTOM, "schema": {"type": "object"}})
+        handler = make_handler("/api/schema-service/v1/schema", _Headers({
+            "Authorization": f"Bearer {server.TOKEN}", "data-partition-id": server.PARTITION,
+            "Content-Length": str(len(body)), "Content-Type": "application/json"}), body)
+        server.Handler.do_POST(handler)
+        self.assertEqual(handler._status, 429)
+        self.assertIn(("Retry-After", "1"), handler._response_headers)
+        self.assertIsNone(server.schema_info_for(self.CUSTOM))
+
+    def test_envelope_and_known_fields_reject_before_individual_mutation(self):
+        for key, value in (("id", []), ("kind", {}), ("data", []), ("acl", []),
+                           ("data", {"FacilityName": 123}), ("legal", {"legaltags": [123]})):
+            rec = valid_well()
+            rec[key] = value
+            self.assertEqual(call("post", "/api/storage/v2/records", [rec])[0], 400)
+            self.assertEqual(server.RECORD_BY_ID, {})
+            self.assertEqual(server.RECORD_VERSIONS, {})
+        rec = valid_well()
+        del rec["legal"]["otherRelevantDataCountries"]
+        self.assertEqual(call("post", "/api/storage/v2/records", [rec])[0], 400)
+
     def test_list_and_execute(self):
         status, payload = call("get", "/api/schema-service/v1/schema")
         self.assertEqual(status, 200)
@@ -1153,6 +1243,8 @@ class TestSchemaService(ServerTestCase):
         status, _ = call("put", "/api/schema-service/v1/schemas/system",
                          {"schema": {"title": "system", "type": "object"}})
         self.assertEqual(status, 200)
+        _, listing = call("get", "/api/schema-service/v1/schema")
+        self.assertEqual({s.get("kind") for s in listing}, {*server.SUPPORTED_KINDS, self.CUSTOM})
 
         status, _ = call("get", f"/api/schema-service/v1/schema/{self.CUSTOM}?x=1")
         self.assertEqual(status, 200)
