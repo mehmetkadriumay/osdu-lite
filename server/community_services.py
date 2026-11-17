@@ -153,13 +153,11 @@ def indexer_api(s, method, suffix, query, payload):
     q = ref.query_values(query, {"kind"} if suffix == "/index" else
                          {"force_clean"} if suffix == "/reindex" else {})
     if suffix == "/partitions/provision":
-        with s.STORE_LOCK:
-            s.SEARCH_BACKEND.provision()
+        s.ensure_index()
         return 200, None
     if suffix == "/index":
         kind = ref.text(q.get("kind"), "kind")
-        with s.STORE_LOCK:
-            s.delete_index_kind(kind)
+        s.delete_index_kind(kind)
         return 200, None
     clean = ref.boolean(q["force_clean"], "force_clean") if "force_clean" in q else False
     if suffix == "/reindex/records":
@@ -168,7 +166,7 @@ def indexer_api(s, method, suffix, query, payload):
         with s.STORE_LOCK:
             if any(rid not in s.RECORD_BY_ID or rid in s.DELETED for rid in ids):
                 raise ref.ReferenceError(404, "One or more records do not exist")
-            index_records(s, ids=ids)
+        index_records(s, ids=ids)
         return 202, {}
     kind = None
     if method == "POST":
@@ -401,8 +399,8 @@ def legacy_extension(s, service, method, suffix, args, query, payload, caller_gr
                 raise ref.ReferenceError(404, "Dataset metadata record not found")
             if not record_visible(s, record, caller_groups):
                 raise ref.ReferenceError(403, "Record ACL does not grant access")
-            s.DELETED.discard(args[0])
-            s.index_current_records(ids=[args[0]])
+            restored = deepcopy(record)
+        s.upsert_records([restored], index_immediately=True)
         return 200, {"datasetRegistries": [deepcopy(record)]}
     if service == "entitlements":
         q = ref.query_values(query, {"type", "cursor", "limit"} if method == "GET" else {},
@@ -501,7 +499,7 @@ def storage_extension(s, method, suffix, args, query, payload, caller_groups):
         with s.STORE_LOCK:
             records = [deepcopy(r) for rid, r in sorted(s.RECORD_BY_ID.items())
                        if rid not in s.DELETED and (kinds is None or r["kind"] in kinds)]
-            s.index_current_records(ids=[record["id"] for record in records])
+        s.index_current_records(ids=[record["id"] for record in records])
         started = now()
         status = [{"kind": kind, "totalRecords": sum(r["kind"] == kind for r in records),
                    "processedRecords": sum(r["kind"] == kind for r in records),
@@ -515,11 +513,12 @@ def storage_extension(s, method, suffix, args, query, payload, caller_groups):
         return 202, {"replayId": key}
     if suffix == "/replay/status/{id}":
         return 200, deepcopy(resource(REPLAYS, args[0]))
-    with s.STORE_LOCK:
-        if suffix == "/records/{id}:delete":
+    if suffix == "/records/{id}:delete":
+        with s.STORE_LOCK:
             resource(s.RECORD_BY_ID, args[0])
-            s.soft_delete_records([args[0]])
-            return 204, None
+        s.soft_delete_records([args[0]])
+        return 204, None
+    with s.STORE_LOCK:
         if method == "DELETE":
             rid = args[0]
             record = resource(s.RECORD_BY_ID, rid)
@@ -541,6 +540,8 @@ def storage_extension(s, method, suffix, args, query, payload, caller_groups):
             # Preserve the latest live record: production also prohibits latest-version purge.
             if record["version"] in selected:
                 ref.bad("Cannot purge the latest version")
+            if any(entry["pins"] for entry in history if entry["version"] in selected):
+                raise s.CapacityError("pinned_version_capacity")
             s.RECORD_VERSIONS[rid] = [entry for entry in history if entry["version"] not in selected]
             return 204, None
         obj(payload, {"records"}, {"records", "attributes"} if suffix.endswith("/headers") else {"records"})

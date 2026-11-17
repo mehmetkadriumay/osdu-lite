@@ -18,6 +18,7 @@ import reference_services
 import community_services
 from search_backend import OpenSearch, BackendError
 from schema_registry import SchemaRegistry, SchemaError
+from runtime_jobs import Scheduler, Job, Outcome, CapacityError
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data"))
@@ -55,9 +56,17 @@ STORE_LOCK = threading.RLock()
 SCHEMA_REGISTRY = SchemaRegistry(lock=STORE_LOCK)
 STATE_GENERATION = 0
 RECORD_BY_ID = {}
-SEARCH_BACKEND = OpenSearch(os.getenv("OPENSEARCH_URL", "http://localhost:9200"), PARTITION)
+SEARCH_BACKEND = None
 INDEX_ERROR = None
+INDEX_RECONCILE = False
+INDEX_RECONCILE_LOCK = threading.RLock()
 INDEX_KIND_GENERATION = {}
+INDEX_SUPPRESSED = set()
+INDEX_SCHEDULER = None
+RUNTIME_ACCEPTING = False
+RECORD_FENCES = {}
+MAX_RECORD_BYTES = 128 * 1024 * 1024
+DELETE_ACK_TIMEOUT = 5
 UPLOAD_TOKENS = {}
 FILE_META = {}
 CURSORS = {}
@@ -233,21 +242,32 @@ def build_full_sample_records():
 FULL_SAMPLE = build_full_sample_records()
 
 def clear_state():
-    global STATE_GENERATION, INDEX_ERROR
+    global STATE_GENERATION, INDEX_ERROR, INDEX_RECONCILE, INDEX_SCHEDULER, RUNTIME_ACCEPTING
+    with STORE_LOCK:
+        RUNTIME_ACCEPTING = False
+    if INDEX_SCHEDULER is not None:
+        if not INDEX_SCHEDULER.stop():
+            raise BackendError(503, "runtime_shutdown_pending")
+    try:
+        SEARCH_BACKEND.start_epoch(uuid.uuid4().hex)
+    except BackendError as exc:
+        INDEX_ERROR = exc
+        raise
     with STORE_LOCK:
         STATE_GENERATION += 1
-        try:
-            SEARCH_BACKEND.reset()
-        except BackendError as exc:
-            INDEX_ERROR = exc
-            raise
         INDEX_ERROR = None
+        INDEX_RECONCILE = False
         INDEX_KIND_GENERATION.clear()
+        INDEX_SUPPRESSED.clear()
         RECORD_BY_ID.clear()
         UPLOAD_TOKENS.clear()
         RECORD_VERSIONS.clear()
+        RECORD_FENCES.clear()
         DELETED.clear()
         RECORD_TS.clear()
+        INDEX_SCHEDULER = Scheduler(_execute_index)
+        INDEX_SCHEDULER.start()
+        RUNTIME_ACCEPTING = True
     with CURSOR_LOCK:
         CURSORS.clear()
     with WORKFLOW_LOCK:
@@ -321,75 +341,157 @@ def validate_record(rec):
         if not is_legal_tag_valid(tag):
             raise ValueError(f"Record {rid}: LegalTag '{tag}' is not valid (expired)")
 
-def index_records_later(records):
+def _execute_index(job):
+    # Reconciliation and normal writes share the same bounded engine boundary.
+    # In particular, a rebuild must not overlap a same-ID scheduled operation.
+    with INDEX_RECONCILE_LOCK:
+        return _execute_index_locked(job)
+
+def _execute_index_locked(job):
+    global INDEX_ERROR
+    record = job.payload
     with STORE_LOCK:
-        generation = STATE_GENERATION
-        snapshots = [(record, deepcopy(record), INDEX_KIND_GENERATION.get(record["kind"], 0))
-                     for record in records]
-        delay = INDEX_DELAY_SECONDS
-    def apply():
-        global INDEX_ERROR
-        time.sleep(delay)
+        fence = RECORD_FENCES.get(job.key)
+        if fence != (record["kind"], record["version"]):
+            return Outcome(False, False, "superseded")
+    try:
+        ensure_index()
+        results = SEARCH_BACKEND.bulk([record])
+        outcome = results[0]
+    except BackendError as exc:
+        outcome = Outcome(False, getattr(exc, "retryable", exc.status == 503), "engine_unavailable")
+    with STORE_LOCK:
+        if outcome.success:
+            INDEX_ERROR = None
+        else:
+            INDEX_ERROR = BackendError(503, outcome.error)
+    return outcome
+
+
+def _retained_bytes():
+    return sum(entry["bytes"] for versions in RECORD_VERSIONS.values() for entry in versions)
+
+
+def _index_job(record, entry=None):
+    done = threading.Event()
+    result = []
+    def settled(outcome):
         with STORE_LOCK:
-            if generation != STATE_GENERATION:
-                return
-            selected = [snapshot for record, snapshot, epoch in snapshots
-                        if RECORD_BY_ID.get(snapshot["id"]) is record
-                        and epoch == INDEX_KIND_GENERATION.get(snapshot["kind"], 0)
-                        and record.get("version") == snapshot.get("version")
-                        and snapshot["id"] not in DELETED]
-            if selected:
-                try:
-                    ensure_index()
-                    SEARCH_BACKEND.bulk(selected)
-                except BackendError as exc:
-                    INDEX_ERROR = exc
-    threading.Thread(target=apply, daemon=True).start()
+            if entry is not None:
+                entry["pins"] -= 1
+                entry["outcome"] = outcome
+                rid = record["id"]
+                if rid not in RECORD_BY_ID:
+                    RECORD_VERSIONS[rid] = [e for e in RECORD_VERSIONS.get(rid, []) if e["pins"]]
+                    if not RECORD_VERSIONS[rid]:
+                        RECORD_VERSIONS.pop(rid)
+            result.append(outcome)
+            done.set()
+    return Job(record["id"], record, terminal=settled), done, result
 
 def upsert_records(records, index_immediately=False):
-    out = []
-    pending = []
+    out, prepared, waits = [], [], []
     now = time.time()
     with STORE_LOCK:
+        if INDEX_SCHEDULER is None or not RUNTIME_ACCEPTING:
+            raise BackendError(503, "runtime_not_started")
+        if not isinstance(records, list) or len(records) > 100:
+            raise ValueError("Expected at most 100 records")
+        ids = set()
+        evictions = {}
+        retained = _retained_bytes()
+        for incoming in records:
+            rec = deepcopy(incoming)
+            validate_record(rec)
+            rid = rec["id"]
+            if rid in ids:
+                raise ValueError("Duplicate record ID in batch")
+            ids.add(rid)
+            fence = RECORD_FENCES.get(rid)
+            if fence and fence[0] != rec["kind"]:
+                raise BackendError(409, "record_kind_conflict")
+            rec["version"] = fence[1] + 1 if fence else 1
+            size = len(json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                  allow_nan=False).encode("utf-8"))
+            if size > 65536:
+                raise BackendError(413, "record_byte_limit")
+            versions = RECORD_VERSIONS.get(rid, [])
+            if len(versions) >= 3:
+                if versions[0]["pins"]:
+                    raise CapacityError("pinned_version_capacity")
+                evictions[rid] = versions[0]
+                retained -= versions[0]["bytes"]
+            retained += size
+            prepared.append((rec, size))
+        if len(set(RECORD_FENCES) | ids) > 5000 or retained > MAX_RECORD_BYTES:
+            raise CapacityError("record_capacity")
+        reservation = INDEX_SCHEDULER.reserve("index", len(prepared))
         try:
-            for incoming in records:
-                rec = deepcopy(incoming)
-                validate_record(rec)
+            jobs = []
+            for rec, size in prepared:
                 rid = rec["id"]
-                old = RECORD_BY_ID.get(rid)
-                version = int(old.get("version", 0)) + 1 if old else int(rec.get("version", 1) or 1)
-                rec["version"] = version
+                version = rec["version"]
+                if rid in evictions:
+                    RECORD_VERSIONS[rid].remove(evictions[rid])
                 RECORD_BY_ID[rid] = rec
-                RECORD_VERSIONS.setdefault(rid, []).append({
-                    "version": version,
-                    "record": deepcopy(rec),
-                    "timestamp": now,
-                })
+                RECORD_FENCES[rid] = (rec["kind"], version)
+                entry = {"version": version, "record": rec, "timestamp": now, "bytes": size, "pins": 1}
+                RECORD_VERSIONS.setdefault(rid, []).append(entry)
                 ts = RECORD_TS.setdefault(rid, {})
                 if "createTime" not in ts:
                     ts["createTime"] = now
                 ts["modify"] = now
                 DELETED.discard(rid)
+                INDEX_SUPPRESSED.discard(rid)
                 out.append({"id": rid, "version": version})
-                pending.append(rec)
+                job, done, result = _index_job(rec, entry)
+                jobs.append(job)
+                waits.append((done, result))
+            reservation.submit(jobs, 0 if index_immediately else min(max(INDEX_DELAY_SECONDS, 0), 5))
         finally:
-            # Preserve indexing of accepted records even if a later record in
-            # this non-transactional Storage batch fails validation.
-            if pending:
-                if index_immediately:
-                    index_current_records([item["id"] for item in out])
-                else:
-                    index_records_later(pending)
+            reservation.cancel()
+    if index_immediately:
+        for done, result in waits:
+            if not done.wait(10) or not result[0].success:
+                raise BackendError(503, "indexing_pending_or_failed")
     return out
 
 def soft_delete_records(record_ids):
-    removed = []
+    return delete_records(record_ids)
+
+
+def delete_records(record_ids, hard=False):
+    waits, removed = [], []
     with STORE_LOCK:
-        for rid in record_ids:
-            if rid in RECORD_BY_ID:
-                DELETED.add(rid)
-                delete_index_record(rid)
-                removed.append(rid)
+        if INDEX_SCHEDULER is None or not RUNTIME_ACCEPTING:
+            raise BackendError(503, "runtime_not_started")
+        if (not isinstance(record_ids, list) or len(record_ids) > 100
+                or any(not isinstance(rid, str) for rid in record_ids)):
+            raise BackendError(400, "Expected at most 100 record IDs")
+        selected = list(dict.fromkeys(rid for rid in record_ids if rid in RECORD_BY_ID))
+        reservation = INDEX_SCHEDULER.reserve("index", len(selected))
+        jobs = []
+        for rid in selected:
+            kind, generation = RECORD_FENCES[rid]
+            generation += 1
+            RECORD_FENCES[rid] = (kind, generation)
+            DELETED.add(rid)
+            marker = {"id": rid, "kind": kind, "version": generation, "_deleted": True}
+            job, done, result = _index_job(marker)
+            jobs.append(job)
+            waits.append((done, result))
+            if hard:
+                RECORD_BY_ID.pop(rid, None)
+                RECORD_TS.pop(rid, None)
+                RECORD_VERSIONS[rid] = [e for e in RECORD_VERSIONS.get(rid, []) if e["pins"]]
+                if not RECORD_VERSIONS[rid]:
+                    RECORD_VERSIONS.pop(rid)
+            removed.append(rid)
+        reservation.submit(jobs)
+    deadline = time.monotonic() + DELETE_ACK_TIMEOUT
+    for done, result in waits:
+        if not done.wait(max(0, deadline - time.monotonic())) or not result[0].success:
+            raise BackendError(503, "deletion_pending")
     return removed
 
 def record_mtime(rid):
@@ -416,7 +518,7 @@ def storage_records_snapshot(kind, deleted_only, modify_after_epoch, descending)
 
 def load_full_sample(index_immediately=True):
     # Community dispatch also takes these locks in this order.
-    with community_services.LOCK, STORE_LOCK:
+    with community_services.LOCK:
         clear_state()
         upsert_records(FULL_SAMPLE, index_immediately=index_immediately)
 
@@ -478,68 +580,115 @@ def kind_matches(pattern, kind):
     return fnmatch.fnmatch(kind.lower(), str(pattern).lower())
 
 def index_current_records(ids=None, kind=None, clean=False):
-    """Synchronous writers select authoritative Storage under its lock."""
-    global INDEX_ERROR
+    """Reindex through the same pinned, ordered work path as storage."""
+    waits = []
     with STORE_LOCK:
-        ensure_index()
-        selected = [deepcopy(record) for rid, record in sorted(RECORD_BY_ID.items())
+        if not RUNTIME_ACCEPTING:
+            raise BackendError(503, "runtime_not_started")
+        selected = [record for rid, record in sorted(RECORD_BY_ID.items())
                     if rid not in DELETED and (ids is None or rid in ids)
                     and (kind is None or kind_matches(kind, record["kind"]))]
-        try:
-            if clean:
-                if kind is None:
-                    SEARCH_BACKEND.reset()
-                else:
-                    SEARCH_BACKEND.delete_kind(kind, pattern=True)
-            SEARCH_BACKEND.bulk(selected)
-        except BackendError as exc:
-            INDEX_ERROR = exc
-            raise
-        return selected
+        replaced = [record for record in selected
+                    if RECORD_FENCES[record["id"]][1] != record["version"]]
+        selected = [record for record in selected if record not in replaced]
+        reservation = INDEX_SCHEDULER.reserve("index", len(selected))
+        jobs = []
+        for record in selected:
+            entry = next(e for e in RECORD_VERSIONS[record["id"]] if e["version"] == record["version"])
+            entry["pins"] += 1
+            job, done, result = _index_job(record, entry)
+            jobs.append(job)
+            waits.append((done, result))
+        reservation.submit(jobs)
+    deadline = time.monotonic() + 10
+    for done, result in waits:
+        if not done.wait(max(0, deadline - time.monotonic())) or not result[0].success:
+            raise BackendError(503, "indexing_pending_or_failed")
+    for record in replaced:
+        upsert_records([record], index_immediately=True)
+    return selected + replaced
 
 def delete_index_record(rid):
-    global INDEX_ERROR
+    return delete_records([rid])
+
+def delete_index_kind(kind):
+    waits = []
+    with STORE_LOCK:
+        if not RUNTIME_ACCEPTING:
+            raise BackendError(503, "runtime_not_started")
+        selected = [(rid, fence) for rid, fence in RECORD_FENCES.items() if fence[0] == kind]
+        reservation = INDEX_SCHEDULER.reserve("index", len(selected))
+        jobs = []
+        for rid, (full_kind, generation) in selected:
+            generation += 1
+            RECORD_FENCES[rid] = (full_kind, generation)
+            INDEX_SUPPRESSED.add(rid)
+            job, done, result = _index_job(
+                {"id": rid, "kind": full_kind, "version": generation, "_deleted": True})
+            jobs.append(job)
+            waits.append((done, result))
+        reservation.submit(jobs)
+    deadline = time.monotonic() + DELETE_ACK_TIMEOUT
+    for done, result in waits:
+        if not done.wait(max(0, deadline - time.monotonic())) or not result[0].success:
+            raise BackendError(503, "deletion_pending")
+
+def ensure_index():
+    global INDEX_ERROR, INDEX_RECONCILE
+    if SEARCH_BACKEND is None:
+        raise BackendError(503, "runtime_not_started")
     try:
-        SEARCH_BACKEND.delete(rid)
+        with INDEX_RECONCILE_LOCK:
+            created = SEARCH_BACKEND.provision()
+            INDEX_RECONCILE = INDEX_RECONCILE or bool(created)
+            if not INDEX_RECONCILE:
+                return
+            with STORE_LOCK:
+                snapshots = [record for rid, record in RECORD_BY_ID.items() if rid not in DELETED
+                             and RECORD_FENCES[rid][1] == record["version"]]
+                pinned = [(record["id"], next(
+                    entry for entry in RECORD_VERSIONS[record["id"]]
+                    if entry["version"] == record["version"])) for record in snapshots]
+                for _, entry in pinned:
+                    entry["pins"] += 1
+                snapshots += [{"id": rid, "kind": RECORD_FENCES[rid][0],
+                               "version": RECORD_FENCES[rid][1], "_deleted": True}
+                              for rid in RECORD_FENCES if rid in DELETED or rid not in RECORD_BY_ID
+                              or RECORD_FENCES[rid][1] != RECORD_BY_ID[rid]["version"]]
+            outcomes = []
+            try:
+                # One-record chunks obey the byte cap even at the 64 KiB record limit.
+                for record in snapshots:
+                    outcomes.extend(SEARCH_BACKEND.bulk([record]))
+            finally:
+                with STORE_LOCK:
+                    for rid, entry in pinned:
+                        entry["pins"] -= 1
+                        if rid not in RECORD_BY_ID:
+                            remaining = [e for e in RECORD_VERSIONS.get(rid, []) if e["pins"]]
+                            if remaining:
+                                RECORD_VERSIONS[rid] = remaining
+                            else:
+                                RECORD_VERSIONS.pop(rid, None)
+            if any(not outcome.success for outcome in outcomes):
+                raise BackendError(503, "index_reconciliation_failed")
+            INDEX_RECONCILE = False
+            INDEX_ERROR = None
     except BackendError as exc:
         INDEX_ERROR = exc
         raise
 
-def delete_index_kind(kind):
-    global INDEX_ERROR
-    with STORE_LOCK:
-        ensure_index()
-        INDEX_KIND_GENERATION[kind] = INDEX_KIND_GENERATION.get(kind, 0) + 1
-        try:
-            SEARCH_BACKEND.delete_kind(kind)
-        except BackendError as exc:
-            INDEX_ERROR = exc
-            raise
-
-def ensure_index():
-    global INDEX_ERROR
-    with STORE_LOCK:
-        try:
-            if INDEX_ERROR is not None or SEARCH_BACKEND.provision():
-                INDEX_ERROR = BackendError(503, "OpenSearch index requires Storage reconciliation")
-                SEARCH_BACKEND.reset()
-                SEARCH_BACKEND.bulk([deepcopy(r) for rid, r in RECORD_BY_ID.items() if rid not in DELETED])
-                INDEX_ERROR = None
-        except BackendError as exc:
-            INDEX_ERROR = exc
-            raise
-
 def indexed_count():
-    with STORE_LOCK:
-        ensure_index()
-        return SEARCH_BACKEND.count()
+    ensure_index()
+    return SEARCH_BACKEND.count()
 
 def search_records(payload, caller_groups=None):
     kind = payload.get("kind")
     if not kind:
         return []
+    ensure_index()
     with STORE_LOCK:
-        ensure_index()
+        payload = dict(payload, _exclude_ids=sorted(DELETED | INDEX_SUPPRESSED))
     return SEARCH_BACKEND.search(payload, caller_groups, bool(payload.get("query_as_owner")))
 
 def _field_values(records, field):
@@ -845,17 +994,64 @@ def sweep_temp_state():
             if now - state.get("updated", 0) > CURSOR_TTL:
                 del CURSORS[cursor]
 
-scan_file_meta()
+def start_runtime(backend=None):
+    """Network initialization is explicit; failed cleanup never publishes readiness."""
+    global SEARCH_BACKEND, INDEX_SCHEDULER, RUNTIME_ACCEPTING, INDEX_ERROR, INDEX_RECONCILE
+    with STORE_LOCK:
+        RUNTIME_ACCEPTING = False
+    if not stop_runtime():
+        raise BackendError(503, "runtime_shutdown_pending")
+    SEARCH_BACKEND = None
+    selected = backend if backend is not None else OpenSearch(
+        os.getenv("OPENSEARCH_URL", "http://localhost:9200"), PARTITION)
+    selected.start_epoch(uuid.uuid4().hex)
+    SEARCH_BACKEND = selected
+    INDEX_ERROR = None
+    INDEX_RECONCILE = False
+    INDEX_SCHEDULER = Scheduler(_execute_index)
+    INDEX_SCHEDULER.start()
+    RUNTIME_ACCEPTING = True
+    try:
+        scan_file_meta()
+        if PRELOAD_FULL_SAMPLE:
+            load_full_sample(index_immediately=True)
+    except Exception:
+        stop_runtime()
+        raise
 
-if PRELOAD_FULL_SAMPLE:
-    load_full_sample(index_immediately=True)
+def stop_runtime():
+    global SEARCH_BACKEND, INDEX_SCHEDULER, RUNTIME_ACCEPTING
+    with STORE_LOCK:
+        RUNTIME_ACCEPTING = False
+    if INDEX_SCHEDULER is not None and not INDEX_SCHEDULER.stop():
+        return False
+    INDEX_SCHEDULER = None
+    SEARCH_BACKEND = None
+    with STORE_LOCK:
+        RECORD_BY_ID.clear()
+        RECORD_VERSIONS.clear()
+        RECORD_FENCES.clear()
+        DELETED.clear()
+        RECORD_TS.clear()
+        UPLOAD_TOKENS.clear()
+        INDEX_KIND_GENERATION.clear()
+        INDEX_SUPPRESSED.clear()
+        SCHEMA_REGISTRY.reset()
+    with CURSOR_LOCK:
+        CURSORS.clear()
+    with WORKFLOW_LOCK:
+        WORKFLOW_RUNS.clear()
+        WORKFLOW_DEFS.clear()
+        WORKFLOW_DEFS.update(seed_workflow_defs())
+    community_services.reset(PARTITION)
+    return True
 
 def backend_errors(method):
     def wrapped(self):
         try:
             return method(self)
-        except (BackendError, SchemaError) as exc:
-            return self._error(exc.status, str(exc))
+        except (BackendError, SchemaError, CapacityError) as exc:
+            return self._error(exc.status, str(exc), {"Retry-After": "1"} if exc.status == 429 else None)
     return wrapped
 
 class Handler(BaseHTTPRequestHandler):
@@ -975,8 +1171,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             else:
                 self._json(status, result)
-        except (reference_services.ReferenceError, BackendError) as exc:
-            self._error(exc.status, str(exc))
+        except (reference_services.ReferenceError, BackendError, CapacityError) as exc:
+            self._error(exc.status, str(exc), {"Retry-After": "1"} if exc.status == 429 else None)
         except Exception:
             # Do not log request data: a request may contain a mock credential.
             self._error(500, "Community service operation failed")
@@ -2187,11 +2383,7 @@ class Handler(BaseHTTPRequestHandler):
                 with STORE_LOCK:
                     if rid not in RECORD_BY_ID and not RECORD_VERSIONS.get(rid):
                         return self._error(404, f"Record not found: {rid}")
-                    RECORD_BY_ID.pop(rid, None)
-                    RECORD_VERSIONS.pop(rid, None)
-                    RECORD_TS.pop(rid, None)
-                    DELETED.discard(rid)
-                    delete_index_record(rid)
+                delete_records([rid], hard=True)
                 return self._no_content()
 
         for prefix in ("/api/storage/v2/records/", "/storage/v2/records/"):
@@ -2203,15 +2395,7 @@ class Handler(BaseHTTPRequestHandler):
                 with STORE_LOCK:
                     if rid not in RECORD_BY_ID:
                         return self._error(404, f"Record not found: {rid}")
-                    if hard:
-                        RECORD_BY_ID.pop(rid, None)
-                        RECORD_VERSIONS.pop(rid, None)
-                        DELETED.discard(rid)
-                        RECORD_TS.pop(rid, None)
-                        delete_index_record(rid)
-                    else:
-                        DELETED.add(rid)
-                        delete_index_record(rid)
+                delete_records([rid], hard=hard)
                 return self._no_content()
 
         for prefix in ("/api/legal/v1/legaltags/", "/legal/v1/legaltags/"):
@@ -2363,13 +2547,19 @@ class Handler(BaseHTTPRequestHandler):
         self._error(404, f"Unknown endpoint: {path}")
 
 def main():
+    start_runtime()
     if not PRELOAD_FULL_SAMPLE:
         clear_state()
     print(f"OSDU Well 360 local server v0.7 listening on http://0.0.0.0:{PORT}")
     print(f"Partition: {PARTITION} | token: {TOKEN if REQUIRE_AUTH else '(auth disabled)'}")
     print(f"Preload full sample configured: {PRELOAD_FULL_SAMPLE} | index delay: {INDEX_DELAY_SECONDS}s")
     print(f"Upload token TTL: {UPLOAD_TOKEN_TTL}s | cursor TTL: {CURSOR_TTL}s")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        stop_runtime()
 
 if __name__ == "__main__":
     main()

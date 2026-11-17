@@ -19,7 +19,7 @@ os.environ.setdefault("INDEX_DELAY_SECONDS", "0")
 import server  # noqa: E402
 from fake_search_backend import FakeSearch
 
-server.SEARCH_BACKEND = FakeSearch()
+server.start_runtime(FakeSearch())
 
 METHODS = {"get": "do_GET", "post": "do_POST", "put": "do_PUT", "delete": "do_DELETE",
            "patch": "do_PATCH", "options": "do_OPTIONS"}
@@ -496,7 +496,8 @@ class TestStorageDeleteAndPaging(ServerTestCase):
         self.put_records([valid_well()])
         status, rec = call("get", "/api/storage/v2/records/company-prod:master-data--Well:WT-1")
         self.assertEqual(status, 200)
-        self.assertEqual(rec["version"], 2)
+        # The acknowledged deletion marker consumes generation 2.
+        self.assertEqual(rec["version"], 3)
 
     def test_single_delete_and_hard_delete(self):
         self.put_records([valid_well()])

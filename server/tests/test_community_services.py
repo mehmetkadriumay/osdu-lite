@@ -16,38 +16,17 @@ INVENTORY = json.loads((Path(__file__).parents[1] / "data/community_api.json").r
 
 class CommunityAcceptance(ServerTestCase):
     def test_reset_prevents_stale_delayed_index_work(self):
-        sleeping, release = threading.Event(), threading.Event()
-        threads = []
-        real_thread = threading.Thread
-
-        def capture_thread(*args, **kwargs):
-            thread = real_thread(*args, **kwargs)
-            threads.append(thread)
-            return thread
-
-        def delayed(_):
-            sleeping.set()
-            release.wait(5)
-
-        old = {**valid_well(), "version": 1}
-        server.RECORD_BY_ID[old["id"]] = copy.deepcopy(old)
-        try:
-            with patch.object(server.time, "sleep", side_effect=delayed), \
-                    patch.object(server.threading, "Thread", side_effect=capture_thread):
-                server.index_records_later([server.RECORD_BY_ID[old["id"]]])
-                self.assertTrue(sleeping.wait(5))
-                server.clear_state()
-                # The same public ID/version can legitimately be recreated after reset.
-                new = {**valid_well(name="NEW-AFTER-RESET"), "version": 1}
-                server.RECORD_BY_ID[new["id"]] = new
-                release.set()
-                threads[0].join(5)
-                self.assertFalse(threads[0].is_alive())
-                self.assertNotIn(old["id"], server.SEARCH_BACKEND.documents)
-        finally:
-            release.set()
-            for thread in threads:
-                thread.join(5)
+        # Delay queued scheduler work instead of intercepting removed per-write threads.
+        with patch.object(server, "INDEX_DELAY_SECONDS", 5):
+            server.upsert_records([valid_well(name="OLD")])
+        previous = server.INDEX_SCHEDULER
+        server.clear_state()
+        self.assertTrue(previous.closed)
+        self.assertEqual(previous.pending("index"), 0)
+        server.upsert_records([valid_well(name="NEW-AFTER-RESET")], index_immediately=True)
+        self.assertFalse(previous.run_ready())
+        self.assertEqual(server.SEARCH_BACKEND.documents[valid_well()["id"]]["data"]["FacilityName"],
+                         "NEW-AFTER-RESET")
 
     def test_partition_lifecycle_limits_and_isolation(self):
         base = "/api/partition/v1/partitions"
@@ -117,9 +96,10 @@ class CommunityAcceptance(ServerTestCase):
         endpoint = "/api/indexer/v2"
         self.assertEqual(call("post", endpoint + "/reindex/records", {"recordIds": [record["id"]]})[0], 404)
         self.assertEqual(call("patch", endpoint + "/reindex?force_clean=true")[0], 200)
-        self.assertFalse(server.SEARCH_BACKEND.documents)
+        # Clean reindex retains versioned deletion fences, never physical deletes.
+        self.assertEqual(server.SEARCH_BACKEND.count(), 0)
         self.assertEqual(call("post", endpoint + "/reindex", {"kind": server.WELL_KIND})[0], 200)
-        self.assertFalse(server.SEARCH_BACKEND.documents)
+        self.assertEqual(server.SEARCH_BACKEND.count(), 0)
         for query in ["force_clean=maybe", "force_clean=true&force_clean=false"]:
             self.assertEqual(call("patch", endpoint + "/reindex?" + query)[0], 400)
         self.assertEqual(call("post", endpoint + "/reindex/records", {"recordIds": ["x"] * 1001})[0], 400)

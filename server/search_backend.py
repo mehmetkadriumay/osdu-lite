@@ -2,6 +2,8 @@
 import hashlib
 import json
 import socket
+import re
+from runtime_jobs import Outcome
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -22,6 +24,15 @@ class OpenSearch:
             raise ValueError("OPENSEARCH_URL must be an HTTP(S) origin without credentials or path")
         self.url = url.rstrip("/")
         self.index = "osdu-lite-" + hashlib.sha256(partition.encode()).hexdigest()[:32]
+        self.owned_prefix = self.index
+
+    def start_epoch(self, epoch):
+        if not re.fullmatch(r"[a-z0-9]{1,32}", epoch):
+            raise ValueError("Invalid process epoch")
+        self.request("DELETE", "/" + self.owned_prefix + "-*", missing_ok=True)
+        self.request("DELETE", "/" + self.owned_prefix, missing_ok=True)
+        self.index = self.owned_prefix + "-" + epoch
+        self.provision()
 
     def request(self, method, path, body=None, missing_ok=False, query=False, ndjson=False):
         data = (body.encode() if ndjson else json.dumps(body).encode()) if body is not None else None
@@ -36,7 +47,9 @@ class OpenSearch:
             # Do not expose engine internals or record contents in public errors.
             if query and exc.code == 400:
                 raise BackendError(400, "Invalid OpenSearch query_string") from exc
-            raise BackendError(503, f"OpenSearch operation failed (HTTP {exc.code})") from exc
+            error = BackendError(503, f"OpenSearch operation failed (HTTP {exc.code})")
+            error.retryable = exc.code in {408, 429} or exc.code >= 500
+            raise error from exc
         except (URLError, TimeoutError, socket.timeout, OSError, ValueError) as exc:
             raise BackendError(503, "OpenSearch unavailable or invalid response") from exc
 
@@ -69,16 +82,38 @@ class OpenSearch:
         self.provision()
 
     def bulk(self, records):
-        for start in range(0, len(records), 200):
+        outcomes = []
+        for start in range(0, len(records), 100):
             lines = []
-            for record in records[start:start + 200]:
-                lines.extend((json.dumps({"index": {"_id": record["id"]}}), json.dumps(record)))
-            response = self.request("POST", f"/{self.index}/_bulk?refresh=true",
-                                    "\n".join(lines) + "\n", ndjson=True)
+            batch = records[start:start + 100]
+            for record in batch:
+                if not isinstance(record.get("version"), int) or record["version"] < 1:
+                    raise BackendError(400, "external_generation_required")
+                lines.extend((json.dumps({"index": {"_id": record["id"],
+                              "version": record["version"], "version_type": "external_gte"}}),
+                              json.dumps(record)))
+            body = "\n".join(lines) + "\n"
+            if len(body.encode("utf-8")) > 1024 * 1024:
+                raise BackendError(400, "bulk_byte_limit")
+            try:
+                response = self.request("POST", f"/{self.index}/_bulk?refresh=true", body, ndjson=True)
+            except BackendError as exc:
+                outcomes.extend(Outcome(False, getattr(exc, "retryable", exc.status == 503),
+                                        "engine_unavailable") for _ in batch)
+                continue
             items = response.get("items", [])
-            if len(items) != len(records[start:start + 200]) or response.get("errors") or any(
-                    item.get("index", {}).get("status", 500) >= 300 for item in items):
-                raise BackendError(503, "OpenSearch indexing failed; check mapping compatibility of stored data")
+            if len(items) != len(batch):
+                outcomes.extend(Outcome(False, True, "invalid_bulk_response") for _ in batch)
+                continue
+            for item in items:
+                status = item.get("index", {}).get("status", 503)
+                outcomes.append(Outcome(200 <= status < 300, status in {408, 429} or status >= 500,
+                                        "" if 200 <= status < 300 else
+                                        "superseded" if status == 409 else "index_failed"))
+        return outcomes
+
+    def tombstone(self, rid, kind, generation):
+        return self.bulk([{"id": rid, "kind": kind, "version": generation, "_deleted": True}])
 
     def delete(self, rid):
         self.request("DELETE", f"/{self.index}/_doc/{quote(rid, safe='')}?refresh=true", missing_ok=True)
@@ -92,7 +127,8 @@ class OpenSearch:
             raise BackendError(503, "OpenSearch kind deletion failed")
 
     def count(self):
-        response = self.request("GET", f"/{self.index}/_count")
+        response = self.request("POST", f"/{self.index}/_count",
+                                {"query": {"bool": {"must_not": [{"term": {"_deleted": True}}]}}})
         if response.get("_shards", {}).get("failed", 0):
             raise BackendError(503, "OpenSearch count incomplete")
         return response["count"]
@@ -117,8 +153,11 @@ class OpenSearch:
         if not isinstance(text, str):
             raise BackendError(400, "query must be a string")
         must = {"match_all": {}} if text.strip() in {"", "*"} else {"query_string": {"query": text}}
-        body = {"query": {"bool": {"must": [must], "filter": filters}},
+        body = {"query": {"bool": {"must": [must], "filter": filters,
+                                 "must_not": [{"term": {"_deleted": True}}]}},
                 "sort": [{"id": "asc"}], "size": 500}
+        if payload.get("_exclude_ids"):
+            body["query"]["bool"]["must_not"].append({"terms": {"id": payload["_exclude_ids"]}})
         scroll = None
         try:
             response = self.request("POST", f"/{self.index}/_search?scroll=1m", body, query=True)

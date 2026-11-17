@@ -2,20 +2,38 @@
 import fnmatch
 import re
 from copy import deepcopy
+from runtime_jobs import Outcome
 
 
 class FakeSearch:
     def __init__(self):
         self.documents = {}
+        self.generations = {}
+
+    def start_epoch(self, epoch):
+        self.reset()
 
     def provision(self):
         pass
 
     def reset(self):
         self.documents.clear()
+        self.generations.clear()
 
     def bulk(self, records):
-        self.documents.update({r["id"]: deepcopy(r) for r in records})
+        outcomes = []
+        for record in records:
+            rid, generation = record["id"], record["version"]
+            if generation < self.generations.get(rid, 0):
+                outcomes.append(Outcome(False, False, "superseded"))
+            else:
+                self.generations[rid] = generation
+                self.documents[rid] = deepcopy(record)
+                outcomes.append(Outcome())
+        return outcomes
+
+    def tombstone(self, rid, kind, generation):
+        return self.bulk([{"id": rid, "kind": kind, "version": generation, "_deleted": True}])
 
     def delete(self, rid):
         self.documents.pop(rid, None)
@@ -25,7 +43,7 @@ class FakeSearch:
                           if not (fnmatch.fnmatchcase(v["kind"], kind) if pattern else v["kind"] == kind)}
 
     def count(self):
-        return len(self.documents)
+        return sum(not r.get("_deleted") for r in self.documents.values())
 
     def search(self, payload, groups=None, owner=False):
         def matches(record, query):
@@ -51,7 +69,8 @@ class FakeSearch:
         kinds = payload.get("kind") or []
         kinds = kinds if isinstance(kinds, list) else [kinds]
         return [deepcopy(r) for _, r in sorted(self.documents.items())
-                if any(fnmatch.fnmatchcase(r["kind"].lower(), k.lower()) for k in kinds)
+                if not r.get("_deleted") and r["id"] not in payload.get("_exclude_ids", [])
+                and any(fnmatch.fnmatchcase(r["kind"].lower(), k.lower()) for k in kinds)
                 and matches(r, payload.get("query"))
                 and (groups is None or set(groups).intersection(
                     r.get("acl", {}).get("owners", []) +
