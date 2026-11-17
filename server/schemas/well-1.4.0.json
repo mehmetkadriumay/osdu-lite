@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:osdu-lite:schema:osdu:wks:master-data--Well:1.4.0",
+  "title": "Well 1.4.0 local compatibility subset",
+  "description": "Validates record.data only. Locally authored from repository samples, not full OSDU conformance. No data property is required; unknown legacy properties remain stored but unmapped.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "FacilityName": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "FacilityDescription": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "FieldName": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "Operator": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "Country": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "SpudDate": {
+      "type": "string",
+      "description": "Samples use YYYY-MM-DD, not RFC 3339 date-time. Kept as keyword string; format:date is outside the finite profile."
+    },
+    "Status": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "SpatialLocation": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/spatialLocation"
+    },
+    "StartM": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/number"
+    }
+  }
+}

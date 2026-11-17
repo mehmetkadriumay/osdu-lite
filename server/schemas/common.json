@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0",
+  "title": "Local compatibility definitions",
+  "description": "Locally authored reusable types for sample record.data only; not an official OSDU schema. This reference resource is not a registered record kind.",
+  "$defs": {
+    "string": {
+      "type": "string"
+    },
+    "number": {
+      "type": "number"
+    },
+    "strings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "spatialLocation": {
+      "type": "object",
+      "description": "Legacy sample GeometryCollection; stored and validated, not converted to geo_point. Object arrays and their descendants are not mapped.",
+      "additionalProperties": true,
+      "properties": {
+        "Wgs84Coordinates": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "type": {
+              "type": "string"
+            },
+            "geometries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "type": {
+                    "type": "string"
+                  },
+                  "coordinates": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

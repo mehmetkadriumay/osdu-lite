@@ -1,0 +1,232 @@
+{
+  "catalogVersion": 1,
+  "description": "Offline, locally authored compatibility subsets for the four existing record kinds. These assets describe record.data, not the record envelope, and do not claim official or full OSDU conformance. Registry enforcement is implemented separately.",
+  "dialect": "https://json-schema.org/draft/2020-12/schema",
+  "hashPolicy": "SHA-256 of each referenced UTF-8 file after replacing CRLF with LF, retaining the final newline. Normalize line endings before verification so Git core.autocrlf checkouts produce the same digest. No other whitespace or JSON canonicalization is applied.",
+  "limits": {
+    "maxKinds": 32,
+    "maxRegistrationBytes": 131072,
+    "maxRegistryBytes": 2097152,
+    "maxMappedFieldsPerKind": 128,
+    "maxDepth": 16,
+    "maxReferencesPerRegistration": 8
+  },
+  "mappingPolicy": [
+    "mappedFields keys are record-relative scalar paths, with engine type and scalar-array flag. All strings have a text subfield named text; scalar arrays use their scalar item mapping.",
+    "Use explicit per-full-kind mappings with dynamic:false; unknown legacy properties remain in _source but are not searchable.",
+    "Do not map object arrays or any descendants of object arrays. SpatialLocation is a legacy GeometryCollection, not a lat/lon point; no coordinate conversion or geo_point is declared.",
+    "SpudDate samples are date-only strings. They remain keyword strings, not date-time values; format:date is outside the finite validation vocabulary.",
+    "Envelope mappings are supplied by the registry: id, kind, acl.owners and acl.viewers are keyword; version is long. Envelope, ACL and legal validation remain separate from these data schemas.",
+    "fieldMappings is the registration-compatible geo_point override map; it is empty for every built-in kind. mappedFields is the explicit catalog declaration, not arbitrary client engine mapping input."
+  ],
+  "sampleInventory": [
+    {
+      "paths": [
+        "examples/well360/samples/sample_dataset_record.json",
+        "examples/well360/samples/sample_well_record.json",
+        "examples/well360/samples/sample_wellbore_record.json",
+        "examples/well360/samples/sample_welllog_record.json",
+        "examples/well360/reference/sample_well_record.json",
+        "examples/well360/reference/sample_wellbore_record.json",
+        "examples/well360/reference/sample_welllog_record.json"
+      ],
+      "notes": "Seven standalone records; all data fields declared in the corresponding schemas."
+    },
+    {
+      "paths": [
+        "examples/well360/samples/manifest_example.json",
+        "examples/well360/reference/manifest_example.json"
+      ],
+      "notes": "Three records per manifest: Well and Wellbore in MasterData, WellLog in Data.WorkProductComponents. Manifest itself is not a fifth record kind. ACL/legal are inherited at ingestion, not validated by these data schemas."
+    },
+    {
+      "paths": [
+        "server/server.py",
+        "server/data/wells.csv",
+        "server/data/wellbores.csv",
+        "server/data/well_logs.csv",
+        "examples/well360/reference/wells.csv",
+        "examples/well360/reference/wellbores.csv",
+        "examples/well360/reference/well_logs.csv"
+      ],
+      "notes": "build_full_sample_records yields 15 records per CSV set: 3 Wells, 4 Wellbores, 4 WellLogs and 4 File.Generic datasets. Includes numeric depths, Curves string array and nested GeometryCollection coordinates."
+    },
+    {
+      "paths": [
+        "server/tests/test_server.py",
+        "server/tests/test_opensearch_integration.py",
+        "server/tests/test_indexing_backend.py",
+        "server/tests/test_community_services.py",
+        "server/community-smoke-test.py"
+      ],
+      "notes": "Additional positive legacy fields: Well.StartM number; WellLog.FacilityName string; File.Generic.FileSource, FacilityName, FieldName and Status strings. File.Generic fixtures sometimes reuse valid_well data. Deliberately malformed negative test values are not compatibility contracts."
+    }
+  ],
+  "resources": [
+    {
+      "id": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0",
+      "file": "common.json",
+      "sha256": "454f9d3232de5a1d8654b9756a59b9cfca640c0a078ed12a72d4c8cd382a99a1",
+      "description": "Locally authored shared definitions only, not a registered record kind. Covered by the repository Apache-2.0 license; no upstream content or license verification claimed."
+    }
+  ],
+  "schemas": [
+    {
+      "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+      "schemaIdentity": {
+        "authority": "osdu",
+        "source": "wks",
+        "entityType": "dataset--File.Generic",
+        "schemaVersionMajor": 1,
+        "schemaVersionMinor": 0,
+        "schemaVersionPatch": 0
+      },
+      "status": "PUBLISHED",
+      "id": "urn:osdu-lite:schema:osdu:wks:dataset--File.Generic:1.0.0",
+      "file": "file-generic-1.0.0.json",
+      "sha256": "d211a71b74e23f31dcaeefef477391efa0d0af5c39409a7c603cfc7431513bf0",
+      "references": ["urn:osdu-lite:schema:osdu-lite:local:common:1.0.0"],
+      "fieldMappings": {},
+      "mappedFields": {
+        "data.Name": {"type": "keyword", "array": false},
+        "data.FileName": {"type": "keyword", "array": false},
+        "data.Format": {"type": "keyword", "array": false},
+        "data.LegacyPath": {"type": "keyword", "array": false},
+        "data.FileSource": {"type": "keyword", "array": false},
+        "data.FacilityName": {"type": "keyword", "array": false},
+        "data.FieldName": {"type": "keyword", "array": false},
+        "data.Status": {"type": "keyword", "array": false}
+      },
+      "provenance": {
+        "authorship": "locally-authored-compatibility-subset",
+        "publicSourceUrl": "https://community.opengroup.org/osdu/data-definitions",
+        "upstreamVerified": false,
+        "upstreamRevision": null,
+        "licenseNote": "Original local schema authored from repository fixtures under the repository Apache-2.0 license (LICENSE). Public URL is background context only; upstream field contracts, revision, content and license are unverified. No upstream schema content copied."
+      },
+      "limitations": [
+        "record.data only; every modeled property is optional for legacy compatibility.",
+        "Known fields have declared types; additionalProperties:true preserves unknown data without mapping it.",
+        "Not an official File.Generic schema and not a full OSDU conformance claim; file contents, existence and legal eligibility are outside this schema."
+      ]
+    },
+    {
+      "kind": "osdu:wks:master-data--Well:1.4.0",
+      "schemaIdentity": {
+        "authority": "osdu",
+        "source": "wks",
+        "entityType": "master-data--Well",
+        "schemaVersionMajor": 1,
+        "schemaVersionMinor": 4,
+        "schemaVersionPatch": 0
+      },
+      "status": "PUBLISHED",
+      "id": "urn:osdu-lite:schema:osdu:wks:master-data--Well:1.4.0",
+      "file": "well-1.4.0.json",
+      "sha256": "e3f78b0846645d3e9f6008d571ab3d3e9423705c1093aabee8296d356e58cc32",
+      "references": ["urn:osdu-lite:schema:osdu-lite:local:common:1.0.0"],
+      "fieldMappings": {},
+      "mappedFields": {
+        "data.FacilityName": {"type": "keyword", "array": false},
+        "data.FacilityDescription": {"type": "keyword", "array": false},
+        "data.FieldName": {"type": "keyword", "array": false},
+        "data.Operator": {"type": "keyword", "array": false},
+        "data.Country": {"type": "keyword", "array": false},
+        "data.SpudDate": {"type": "keyword", "array": false},
+        "data.Status": {"type": "keyword", "array": false},
+        "data.SpatialLocation.Wgs84Coordinates.type": {"type": "keyword", "array": false},
+        "data.StartM": {"type": "double", "array": false}
+      },
+      "provenance": {
+        "authorship": "locally-authored-compatibility-subset",
+        "publicSourceUrl": "https://community.opengroup.org/osdu/data-definitions",
+        "upstreamVerified": false,
+        "upstreamRevision": null,
+        "licenseNote": "Original local schema authored from repository fixtures under the repository Apache-2.0 license (LICENSE). Public URL is background context only; upstream field contracts, revision, content and license are unverified. No upstream schema content copied."
+      },
+      "limitations": [
+        "record.data only; every modeled property is optional for legacy compatibility.",
+        "Known fields have declared types; additionalProperties:true preserves unknown data without mapping it.",
+        "SpudDate is a date-only sample string, not a validated date-time. GeometryCollection object arrays are validated but unmapped; no built-in geo_point.",
+        "Not an official Well schema and not a full OSDU conformance claim; geometry semantics and domain relationships are not asserted."
+      ]
+    },
+    {
+      "kind": "osdu:wks:master-data--Wellbore:1.4.0",
+      "schemaIdentity": {
+        "authority": "osdu",
+        "source": "wks",
+        "entityType": "master-data--Wellbore",
+        "schemaVersionMajor": 1,
+        "schemaVersionMinor": 4,
+        "schemaVersionPatch": 0
+      },
+      "status": "PUBLISHED",
+      "id": "urn:osdu-lite:schema:osdu:wks:master-data--Wellbore:1.4.0",
+      "file": "wellbore-1.4.0.json",
+      "sha256": "ef061572d00c935194e1ab40b5c9d0310739dee3cc5d7e46a3aa892056aebbd7",
+      "references": ["urn:osdu-lite:schema:osdu-lite:local:common:1.0.0"],
+      "fieldMappings": {},
+      "mappedFields": {
+        "data.FacilityName": {"type": "keyword", "array": false},
+        "data.WellID": {"type": "keyword", "array": false},
+        "data.MeasuredDepthM": {"type": "double", "array": false},
+        "data.TrueVerticalDepthM": {"type": "double", "array": false},
+        "data.WellboreType": {"type": "keyword", "array": false},
+        "data.Status": {"type": "keyword", "array": false}
+      },
+      "provenance": {
+        "authorship": "locally-authored-compatibility-subset",
+        "publicSourceUrl": "https://community.opengroup.org/osdu/data-definitions",
+        "upstreamVerified": false,
+        "upstreamRevision": null,
+        "licenseNote": "Original local schema authored from repository fixtures under the repository Apache-2.0 license (LICENSE). Public URL is background context only; upstream field contracts, revision, content and license are unverified. No upstream schema content copied."
+      },
+      "limitations": [
+        "record.data only; every modeled property is optional for legacy compatibility.",
+        "Known fields have declared types; additionalProperties:true preserves unknown data without mapping it.",
+        "Not an official Wellbore schema and not a full OSDU conformance claim; WellID existence and depth relationships are not checked."
+      ]
+    },
+    {
+      "kind": "osdu:wks:work-product-component--WellLog:1.4.0",
+      "schemaIdentity": {
+        "authority": "osdu",
+        "source": "wks",
+        "entityType": "work-product-component--WellLog",
+        "schemaVersionMajor": 1,
+        "schemaVersionMinor": 4,
+        "schemaVersionPatch": 0
+      },
+      "status": "PUBLISHED",
+      "id": "urn:osdu-lite:schema:osdu:wks:work-product-component--WellLog:1.4.0",
+      "file": "welllog-1.4.0.json",
+      "sha256": "fc33ca058f7f6fd98fdb748cdc9c74b77208837929de8d59bd7fdda85fc06c56",
+      "references": ["urn:osdu-lite:schema:osdu-lite:local:common:1.0.0"],
+      "fieldMappings": {},
+      "mappedFields": {
+        "data.Name": {"type": "keyword", "array": false},
+        "data.FacilityName": {"type": "keyword", "array": false},
+        "data.WellboreID": {"type": "keyword", "array": false},
+        "data.Datasets": {"type": "keyword", "array": true},
+        "data.Curves": {"type": "keyword", "array": true},
+        "data.StartM": {"type": "double", "array": false},
+        "data.StopM": {"type": "double", "array": false},
+        "data.FileName": {"type": "keyword", "array": false}
+      },
+      "provenance": {
+        "authorship": "locally-authored-compatibility-subset",
+        "publicSourceUrl": "https://community.opengroup.org/osdu/data-definitions",
+        "upstreamVerified": false,
+        "upstreamRevision": null,
+        "licenseNote": "Original local schema authored from repository fixtures under the repository Apache-2.0 license (LICENSE). Public URL is background context only; upstream field contracts, revision, content and license are unverified. No upstream schema content copied."
+      },
+      "limitations": [
+        "record.data only; every modeled property is optional for legacy compatibility.",
+        "Known fields have declared types; additionalProperties:true preserves unknown data without mapping it.",
+        "Datasets and Curves are scalar string arrays, not aggregation fields. No file parsing or referenced-record lookup.",
+        "Not an official WellLog schema and not a full OSDU conformance claim; depth ordering and domain relationships are not asserted."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:osdu-lite:schema:osdu:wks:work-product-component--WellLog:1.4.0",
+  "title": "WellLog 1.4.0 local compatibility subset",
+  "description": "Validates record.data only. Locally authored from repository samples and legacy test fixtures, not full OSDU conformance. No data property is required; unknown legacy properties remain stored but unmapped.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "Name": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "FacilityName": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "WellboreID": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "Datasets": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/strings"
+    },
+    "Curves": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/strings"
+    },
+    "StartM": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/number"
+    },
+    "StopM": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/number"
+    },
+    "FileName": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    }
+  }
+}

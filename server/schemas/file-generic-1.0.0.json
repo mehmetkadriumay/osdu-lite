@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:osdu-lite:schema:osdu:wks:dataset--File.Generic:1.0.0",
+  "title": "File.Generic 1.0.0 local compatibility subset",
+  "description": "Validates record.data only. Locally authored from repository samples, including file metadata and legacy test-fixture fields; not full OSDU conformance. No data property is required; unknown legacy properties remain stored but unmapped.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "Name": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "FileName": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "Format": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "LegacyPath": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "FileSource": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "FacilityName": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "FieldName": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    },
+    "Status": {
+      "$ref": "urn:osdu-lite:schema:osdu-lite:local:common:1.0.0#/$defs/string"
+    }
+  }
+}
