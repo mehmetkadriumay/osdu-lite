@@ -1,6 +1,6 @@
 # OSDU-Lite
 
-An OSDU API emulator with in-memory Storage and real OpenSearch, for development, demos, and CI.
+An OSDU API emulator with Azurite-backed Storage and real OpenSearch, for development, demos, and CI.
 
 [![CI](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/ci.yml)
 [![Container image](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/publish-docker.yml/badge.svg)](https://github.com/mehmetkadriumay/osdu-lite/actions/workflows/publish-docker.yml)
@@ -10,7 +10,7 @@ Search, Dataset, File, Workflow, Legal, Schema, Entitlements, CRS, Unit, Indexer
 Notification, Partition, Register and Secret. Clients exercising the supported
 subset can point at `http://localhost:8089`; check the operation inventory and
 documented mock limitations before substituting for a real deployment.
-One local OpenSearch node is required; no cloud or OIDC is required.
+Local Azurite Blob Storage and OpenSearch are required; no cloud or OIDC is required.
 
 This repo also contains a working integration around it - the Well 360 example
 (Well -> Wellbore -> WellLog -> Dataset -> LAS) with a Java consumer compiled
@@ -18,7 +18,149 @@ against `os-core-common`. See [Releases and changelog](CHANGELOG.md).
 
 > Scope: this is a test double, not a deployment. It proves workflows and payload
 > shapes and uses actual Lucene query semantics. It is not certified upstream
-> OSDU, durable Storage, data-plane ACLs at scale, legal blocking, or OIDC/IAM.
+> OSDU, production-grade durability, data-plane ACLs at scale, legal blocking, or OIDC/IAM.
+
+## Selected core profile: implementation checkpoint, release gates open
+
+The [focused implementation PRD](docs/projects/feature-rpi-osdu-core/feature-rpi-osdu-core.prd.md)
+has implemented EPIC-001..008 and EPIC-009's offline migration/deployment
+configuration. **Release acceptance is not complete.** The worktree implements
+snapshot2/control durability, live principal/ACL/legal authorization, core
+Storage/Schema, private File/Dataset publication, schema-derived per-kind
+indexing, core Search and revision-bound Storage/Search reference cursors.
+The default remains `OSDU_COMPAT_PROFILE=legacy`; set it to `core`
+only for implemented operations and inspect `/info`'s compatibility inventory.
+Unknown profile values fail startup; core requires `REQUIRE_AUTH=true`.
+
+Core Storage supports generated IDs,201 string-ID results, `skipdupes`,
+retained versions, audit fields, soft-delete/purge, paginated lists and bounded metadata/data PATCH.
+Metadata-only PATCH keeps data version/audit timestamps. Both profiles now reject
+retention exhaustion rather than evict history (1,000 versions/ID,128MiB retained,
+5,000 lifetime IDs). Purge retains the kind/version watermark.
+Storage and Search cursors retain ID/version/sort references, not full sources;
+any authoritative revision/group/legal change invalidates them. They are
+principal/service bound, expire after300s, and are capped at64 live cursors,
+16MiB serialized combined state and5,000 references.
+
+Local principals optionally come from private `OSDU_IDENTITIES_FILE` JSON:
+`[{"principal":"alice","token":"<private-token>","groups":["<role-or-data-group>"]}]`.
+Without it, `OSDU_TOKEN` identifies `demo@osdu-lite.local`. Membership seeds only
+new partitions/format1 migration, not format2 restarts; an existing partition's
+entitlements administrator must provision missing core roles. ACL/legal checks
+apply to legacy routes too; a service role does not bypass record ACLs.
+Unknown bearer errors no longer disclose tokens. Referenced legal tags/data
+groups cannot be deleted while retained history or metadata overrides use them;
+remove membership or expire legal validity instead of deleting dependencies.
+
+**Upgrade warning:** stop the sole writer and take a consistent offline backup
+of the Azurite volume and local files before starting this version. Startup
+migrates format1 to format2 with a verified create-only copy of original snapshot
+bytes. Custom schemas, legal tags and groups persist alongside records. Format1
+cannot recover previously volatile custom definitions: provide the PRD's private
+`OSDU_CORE_IMPORT_FILE` import when needed; unresolved dependencies fail closed.
+That file is ignored after format2 exists. Switching to legacy is **not** a
+storage downgrade; rollback requires the matching old image and offline backup
+together and loses subsequent writes.
+
+**Files:** core File/Dataset supports real private Azurite staging,
+streamed immutable publication and scoped SDK write/read SAS. Normal core startup
+requires `AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT` to be the client-reachable account
+root (for example `http://pi-a:10000/devstoreaccount1`); the existing connection
+string remains the internal SDK endpoint. Default `PRELOAD_FULL_SAMPLE=true`
+now binds only the four hash-pinned shipped samples before readiness, using
+deterministic private blob keys. Restarts preserve bindings and record versions.
+Unbound user-file records fail startup with record identifiers; they require
+offline migration (not automatic copying from `FILES_DIR`). New core and legacy uploads do not become local/anonymous
+`/files/{name}` content. SAS expires within1M..1H; policy changes deny new URLs,
+but do not revoke issued URLs. Finalization checks256MiB and streams1MiB chunks;
+direct staging uploads still require operator disk monitoring/quotas.
+
+Legacy `/upload/{token}` now streams to private staging in1MiB chunks; only
+the token's SHA-256 and an independent staging key are persisted. Register
+the returned `FileSource` through File metadata or Dataset registration;
+display filenames are not upload authority. Bound download instructions issue
+real read SAS; only immutable shipped samples remain anonymously readable.
+The adapter/sample real HTTP acceptance passed against isolated Azurite.
+To repeat it,
+set `AZURITE_TEST_CONNECTION_STRING` and `AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT`,
+then run `python -m unittest discover -s server/tests -p test_server.py -k TestRealLegacySampleHTTP -v`.
+
+Schema DEVELOPMENT→PUBLISHED→OBSOLETE lifecycle remains finite and locally
+authored, not an official full schema catalog. Core Search supports current
+authorized totals/owner mode, compatible scalar sorts, array-aware source
+projection and one terms aggregation (100-value cap). Registered kinds use
+separate immutable mappings, one primary/zero replicas each, max8 active kinds.
+Unknown schema-permitted fields remain retrievable but are not dynamically
+searchable; spatial/advanced features and immediate SAS revoke return501.
+The checked-in contract fixture retains public-source hashes and deliberate
+deviations (including the bounded local batch envelope). `/info` is the
+supported/deferred inventory, not an upstream conformance certificate.
+
+**Offline local files (API stopped):**
+`python server/migrate_files.py --manifest /private/files.json --dry-run`
+(default); apply adds `--apply --writer-stopped`. Manifest is a JSON array of
+`{recordId,sourcePath,sha256}`, with paths relative beneath existing `FILES_DIR`.
+All entries/candidate state preflight before any writes; source/hash/path,
+duplicate, record/kind and snapshot conflicts fail closed. Apply uses verified
+create-only deterministic private final blobs and one ETag binding snapshot,
+preserves original files/records/versions/fences, and is idempotent. It requires
+an already bootstrapped/imported **format2** snapshot, never silently upgrades
+format1 or drops controls. Failures expose no new binding and report possible
+private orphan keys only; successful staging bytes also remain for offline
+inventory. See [the runbook](installRPI.md) for mounts, backup and recovery.
+
+Exactly three services remain. Both Compose files have local-SSD persistence
+and API2GiB/Azurite2GiB/OpenSearch6GiB limits with configurable initial2GiB heap.
+Azurite's default published address is loopback; set its LAN bind/public
+endpoint together only behind a trusted firewall. The public endpoint is an
+account root, separate from internal Azure DNS. The two-Pi runbook places
+API+Azurite on Pi A and the engine on Pi B, **16GiB each, nonpooled, no HA**;
+no cross-host Compose, Swarm, Kubernetes, NFS node storage, IdP or new service.
+Known development keys/HTTP make this a trusted-LAN setup, not secret demo
+security. Optional identity/import files must be private and read-only mounted.
+
+**Evidence and remaining gates:** prior parent EPIC-008 acceptance passed122
+focused cases,21 real ARM64 engine cases and8 affected legacy paging cases.
+Earlier real File/Storage and API/Azurite recreation evidence is retained in
+the PRD. This migration checkpoint passes19 unit/config cases and2 new real SDK
+migration cases (apply/retry and stale-ETag rollback). **Release verification is
+BLOCKED, not complete:** current discovery with both real backends ran432 cases:
+430 passed,1 failure,1 error,0 skips. Earlier normal discovery passed388 of431
+cases with43 opt-in skips, before the last legacy-registration regression test.
+The102-case real-module run passed with no skips. All3 HTTP smokes and the real
+Java full-sample demo passed. Last narrow repair's owner/import cases passed2/2;
+tutorial401 was repaired, but its next Dataset registration failed because the
+legacy reader calls `.get()` on the demo's JSON array. The complete432-case run
+was not repeated and manifest/recreation were not started after that failure.
+The prior "unrelated Dataset-undelete baseline" attribution is withdrawn:
+core publication/read-revision guards caused legacy undelete/replay failures and
+were fixed test-first. No usable pre-core byte snapshot was found.
+See `docs/projects/feature-rpi-osdu-core/feature-rpi-osdu-core.release-verification.md`
+for exact failed tests, commands and next actions. **CI NOT RUN.**
+The normal final Dockerfile build failed TLS to files.pythonhosted.org;
+host download/rehashed existing ARM64 wheels succeeded, not a normal build pass.
+The final-source offline-equivalent API image built using the18 existing hashed
+wheels: latest Linux ARM64 image142,554,912 bytes; all12 packaged Python inputs matched current
+source hashes. Actual legacy sample search/SAS and core CRUD/skipdupes/schema-driven
+search/private File SAS passed. API and Azurite container recreation retained18
+records, custom schema, versions and1,048,598 uploaded bytes/SHA-256, with no
+local-files mount or reseeding. This is WSL ARM64 correctness evidence, not Pi
+performance or a normal networked Dockerfile build pass.
+Published `latest` is **not these uncommitted changes**; build current source
+or set a verified custom `IMAGE` in the pull configuration.
+
+Actual Pi load/RSS/latency/thermal/SSD measurements: **NOT VALIDATED** (hardware
+unavailable). Full-snapshot copies/history pins, Python object/JSON/SDK memory
+amplification at128MiB retained/5,000 lifetime IDs and up to8 shards (4 samples)
+are meaningful risks under these limits, not a load benchmark. Actual
+Complete core-only added/deleted lines cannot be measured without the captured
+pre-core bytes; HEAD and cumulative dirty deltas are not substitutes.
+Identifiable wholly-new core files alone total1,027 runtime lines (4 modules)
+and3,143 test lines (8 files), excluding edits to shared modules/tests and the
+earlier user/Azurite work. This subtotal is **not a complete feature delta**.
+The migrator is236 lines and its tests382; three services/zero new runtime
+dependencies do not by themselves make the added application complexity small.
+Existing workflows/mock services remain limited. **Not Pi-ready or full OSDU conformance.**
 
 ## Quickstart
 
@@ -39,25 +181,35 @@ wslc.exe version
 Then open your **WSL terminal** (for example, Ubuntu). The commands below use
 Windows interoperability to invoke `wslc.exe` from the Linux shell; keep the
 `.exe` suffix. No repository clone or local Python installation is needed to
-start the published image:
+start the published legacy image (not this uncommitted core checkpoint):
 
 ```bash
 wslc.exe network create osdu-lite-net
+wslc.exe pull mcr.microsoft.com/azure-storage/azurite:3.35.0
+wslc.exe run --rm -d --name osdu-lite-azurite --network osdu-lite-net --network-alias azurite \
+  --memory 2g -p 127.0.0.1:10000:10000 \
+  -v osdu-lite-azurite-data:/data mcr.microsoft.com/azure-storage/azurite:3.35.0 \
+  azurite-blob --blobHost 0.0.0.0 --location /data --disableProductStyleUrl --disableTelemetry
+# Public Azurite development key, not an Azure credential:
+export AZURE_STORAGE_CONNECTION_STRING='DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;'
 wslc.exe pull opensearchproject/opensearch:3.9.0
 wslc.exe run --rm -d --name osdu-lite-opensearch --network osdu-lite-net --network-alias opensearch \
+  --memory 6g -v osdu-lite-opensearch-data:/usr/share/opensearch/data \
   -e discovery.type=single-node -e DISABLE_INSTALL_DEMO_CONFIG=true -e DISABLE_SECURITY_PLUGIN=true \
-  -e 'OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m' -e node.store.allow_mmap=false \
+  -e 'OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g' -e node.store.allow_mmap=false \
   --health-cmd 'curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow' \
   --health-interval 5s --health-timeout 3s --health-retries 30 opensearchproject/opensearch:3.9.0
 # Wait for the OpenSearch container to be healthy before starting the API:
 wslc.exe container list
 wslc.exe pull ghcr.io/mehmetkadriumay/osdu-lite:latest
-wslc.exe run --rm -d --name osdu-well360 --network osdu-lite-net -p 8089:8089 \
-  -e OPENSEARCH_URL=http://opensearch:9200 ghcr.io/mehmetkadriumay/osdu-lite:latest
+wslc.exe run --rm -d --name osdu-well360 --network osdu-lite-net --memory 2g -p 8089:8089 \
+  -e OPENSEARCH_URL=http://opensearch:9200 \
+  -e AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT=http://localhost:10000/devstoreaccount1 \
+  -e AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" ghcr.io/mehmetkadriumay/osdu-lite:latest
 ```
 
 The API is available at **http://localhost:8089**, with 15 sample records
-preloaded. From WSL, wait for startup and check health:
+preloaded only when no persisted partition exists. From WSL, wait for startup and check health:
 
 ```bash
 curl --fail --retry 20 --retry-connrefused --retry-delay 1 http://localhost:8089/health
@@ -70,18 +222,20 @@ wslc.exe container list
 wslc.exe logs osdu-well360
 wslc.exe stop osdu-well360
 wslc.exe stop osdu-lite-opensearch
+wslc.exe stop osdu-lite-azurite
 wslc.exe network rm osdu-lite-net
 ```
 
-`--rm` removes each container after it stops. Storage is in memory; starting a
-new API container resets its managed partition index and reloads the sample.
+`--rm` removes each container after it stops. Records, retained versions,
+timestamps and deletion fences survive in the named Azurite volume. Starting a
+new API container restores Storage and rebuilds its managed partition index.
 Use unique names/network if any of these names are already in use; never stop
-an unrelated instance. Reserve at least 2 GB for OpenSearch. Security is disabled
+an unrelated instance. OpenSearch has a 6GiB limit/initial2GiB heap. Security is disabled
 for this private local-development bridge only: do not publish its ports or
 use this configuration in production. No global sysctl changes are needed.
-Only the API port is published. A WSLc `--internal` network cannot forward the
+API and loopback-only Blob ports are published; engine ports are not. A WSLc `--internal` network cannot forward the
 API's published port by itself; Compose uses a separate frontend network for
-the API and an internal backend network for OpenSearch.
+the API and an internal backend network for OpenSearch and Azurite.
 
 `latest` tracks `main`; pushing a `v*` tag to `mehmetkadriumay/osdu-lite`
 also publishes matching versioned images. Both `amd64` and `arm64` are supported.
@@ -94,8 +248,10 @@ the Windows executable:
 
 ```bash
 wslc.exe build -t osdu-lite:local "$(wslpath -w "$PWD/server")"
-wslc.exe run --rm -d --name osdu-well360 --network osdu-lite-net -p 8089:8089 \
-  -e OPENSEARCH_URL=http://opensearch:9200 osdu-lite:local
+wslc.exe run --rm -d --name osdu-well360 --network osdu-lite-net --memory 2g -p 8089:8089 \
+  -e OPENSEARCH_URL=http://opensearch:9200 \
+  -e AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT=http://localhost:10000/devstoreaccount1 \
+  -e AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" osdu-lite:local
 ```
 
 Stop any previously started `osdu-well360` container before running the local
@@ -126,6 +282,12 @@ OpenSearch launch flags above but add `-p 127.0.0.1:9200:9200`. This is a
 use an existing local node. The API defaults to `http://localhost:9200` and fails
 startup clearly if the node is unavailable (5-second request timeout).
 
+Start Azurite too. For a native API with the WSL-container emulator, add
+`-p 127.0.0.1:10000:10000` to the Azurite command above. Native Python defaults
+to Azurite's public development account at `http://127.0.0.1:10000/devstoreaccount1`;
+unset the container connection string or replace its `azurite` hostname with
+`127.0.0.1`. Startup fails if Blob Storage is unavailable; there is no memory fallback.
+
 For native development and tests, install the pinned **binary-only** runtime
 dependencies first (including pyproj 3.7.2 and certifi). Use CPython 3.11 or
 3.12 and an isolated environment:
@@ -136,6 +298,7 @@ source .venv/bin/activate              # Windows PowerShell: .venv\Scripts\Activ
 python -m pip install --only-binary=:all: --require-hashes -r server/requirements.txt
 python -m unittest discover -s server/tests -v
 OPENSEARCH_TEST_URL=http://localhost:9200 python -m unittest discover -s server/tests -p test_opensearch_integration.py -v
+AZURITE_TEST_CONNECTION_STRING="$(PYTHONPATH=server python -c 'from storage_backend import AZURITE_CONNECTION_STRING; print(AZURITE_CONNECTION_STRING)')" python -m unittest discover -s server/tests -p test_storage_backend.py -v
 python server/server.py
 ```
 
@@ -158,7 +321,8 @@ make stop
 ```
 
 `make demo` does all four in sequence. `make pull-up` is the image equivalent of
-`make start` (via `server/compose.pull.yaml`).
+`make start` (via `server/compose.pull.yaml`). Both Compose files start Azurite
+with a named `azurite-data` volume. Stopping the stack retains records.
 
 ### Runtime defaults
 
@@ -167,18 +331,38 @@ make stop
 | `PORT`               | `8089`               | listen port                                   |
 | `OSDU_PARTITION`     | `company-prod`       | accepted `data-partition-id`                  |
 | `OSDU_TOKEN`         | `demo-token`         | accepted bearer token                         |
+| `OSDU_COMPAT_PROFILE` | `legacy` | explicit `core` selected bounded contract |
+| `OSDU_IDENTITIES_FILE` | unset | optional private local principal/token/group seed JSON; use readonly mounts |
+| `OSDU_CORE_IMPORT_FILE` | unset | optional private format1/new-partition control import; ignored after format2 |
 | `REQUIRE_AUTH`       | `true`               | validate `Authorization` and RBAC             |
-| `PRELOAD_FULL_SAMPLE`| `true`               | seed 15 Well 360 records on start             |
+| `PRELOAD_FULL_SAMPLE`| `true`               | seed 15 records only for a new persisted partition |
 | `INDEX_DELAY_SECONDS`| `0.7`                | local delay before real indexing and refresh |
 | `OPENSEARCH_URL`     | `http://localhost:9200` | OpenSearch origin; containers use `http://opensearch:9200` |
+| `AZURE_STORAGE_CONNECTION_STRING` | local Azurite development account | Blob endpoint and credentials; Compose uses `azurite:10000` |
+| `AZURE_STORAGE_CONTAINER` | `osdu-records` | Blob container holding partition snapshots |
+| `AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT` | unset; Compose localhost account root | required for normal core startup; client-reachable URL independent of internal SDK DNS |
 
 The demo token is a member of every group, so RBAC checks (HTTP 403 on a missing
 entitlement) pass in all walkthroughs but still fail for unknown tokens.
 
 ## What is emulated
 
-Storage and non-search services are in memory; every process restart resets the
-managed OpenSearch index to match that clean state.
+Storage uses one atomically replaced JSON blob per partition, with an in-process
+read cache. Mutations commit to Blob Storage before indexing is queued or success
+is returned. Restart restores records, retained history, timestamps, soft deletes,
+hard-delete generation fences and index suppression, then rebuilds OpenSearch.
+ETag conditions reject stale writers instead of silently overwriting another
+process's snapshot. Use one API process per partition; this bounded snapshot
+design is for local development, not a scalable production storage layer.
+
+Custom schemas, legal tags, groups/members and file bindings/grants persist in
+snapshot2; uploaded File/Dataset bytes persist privately in Azurite. Workflow
+runs/cursors and other explicitly documented mock collections remain volatile.
+`FILES_DIR` is only a source for explicit offline migration; shipped immutable
+samples alone are automatically bound at startup.
+`POST /poc/reset` explicitly persists an empty partition; `POST /poc/load-full-sample`
+explicitly replaces it with the sample. `PRELOAD_FULL_SAMPLE` never overwrites an
+existing partition, including an explicitly emptied one.
 
 | Service      | API  | Highlights                                                          |
 | ------------ | ---- | ------------------------------------------------------------------- |
@@ -259,7 +443,7 @@ inventory, **not a count of all legacy routes or a claim of full production API
 parity**. `test_pinned_inventory_success` executes every inventory entry, checks
 its success status/envelope and observable behavior, and rejects missing coverage.
 Baseline contracts remain covered; unit tests explicitly inject an isolated fake
-backend. CI separately exercises a pinned real OpenSearch service and HTTP smokes.
+backends. CI separately exercises pinned real Azurite and OpenSearch services and HTTP smokes.
 
 Each entry inherits its exact source URL, public API version, capability
 (`native`, `local-opensearch` or `mock`), and SHA-256 from the service. Repository revisions pin the
@@ -329,9 +513,9 @@ physical/foreign index. Refresh completes before these operations return success
 Storage replay uses the same real indexing path, but remains a
 synchronous mock job with completed per-kind status, not a cloud queue/event
 replay. Historical version purge accepts `versionIds` or `from`/`limit`, and
-refuses to delete the latest version. File revoke invalidates the local mock
-storage account's outstanding upload grants; it is not cloud signed-URL
-cryptography or revocation of already downloaded files.
+refuses to delete the latest version. Core immediate File revoke returns501.
+Legacy revocation markers can deny new issuance but do not invalidate already
+issued ad-hoc SAS URLs, which remain bearer credentials until expiry.
 
 ### OpenSearch behavior and limits
 
@@ -342,30 +526,29 @@ GHCR publishes only the Python API image; it consumes this separate official
 engine image. No Dashboards, Kafka, Java Indexer deployment or cloud messaging
 is involved.
 
-One index named `osdu-lite-<32 hex SHA-256 characters of OSDU_PARTITION>` is owned
-by the configured API. Startup/reset deletes **only that exact index**. Do not
-run multiple API processes with the same partition against one node: their
-ephemeral Storage would disagree. No foreign or wildcard index deletion occurs.
+Indexes named `osdu-lite-<32 hex partition hash>-<full kind SHA-256>-<epoch>` are
+owned by the configured API. Startup/reset removes that partition's prior epochs
+and legacy exact index, then rebuilds from persisted Storage. Do not run multiple
+API processes with the same partition against one node. Other partitions' indexes
+and storage blobs are not reset.
 
-Queries go unchanged to OpenSearch `query_string`; empty/`*` becomes `match_all`.
+Core queries use OpenSearch `query_string`; empty/`*` becomes `match_all`.
 Malformed Lucene syntax returns 400, never substring fallback. Standard text
-analysis means `data.FacilityName:"EAGLE-01"` is an analyzed phrase, not Python
-whole-value equality; use `data.FacilityName.keyword:"EAGLE-01"` for exact values.
-IDs, kinds and ACLs are keyword fields; data strings have text and `.keyword`
-fields. Sample depth/coordinate fields are numeric and `data.SpudDate` is a
-date. Other values use dynamic types with automatic date detection disabled.
-Heterogeneous kinds with incompatible types for the same path will fail indexing
-explicitly (503); normalize input rather than expecting per-kind mappings.
+analysis is not Python whole-value equality. Registered string leaves are
+keyword with a `.text` analyzed subfield. Legacy adapts its former bare-field
+text and `.keyword` aliases; core uses explicit registered mapping paths.
+Numeric/date fields follow each kind's schema. `dynamic:false` prevents unknown
+allowed data from becoming searchable. Different kinds can safely map the same
+path differently; cross-kind sort/aggregation requires compatible capabilities.
 
-Kind and viewer/owner ACL filters run in OpenSearch **before** totals, paging and
-aggregations; `query_as_owner` restricts to owners. Auth-disabled mode is a local
-bypass. Results retain stable ID order, not relevance order (boosts are parsed
-but do not change that order). The adapter exhausts a 500-document scroll,
-clears engine scroll resources, and materializes all authorized matches for the
-existing Python pagination/aggregation and expiring cursor snapshot contracts.
-This intentionally scales with matched data, not for unbounded production
-datasets. Cursor snapshots are caller-and-entitlement-bound and may retain
-records changed/deleted after snapshot creation until expiry.
+Authoritative current ACL/legal/deletion allowed-ID filters run in OpenSearch
+**before** totals, paging and aggregations. Core `queryAsOwner` restricts to
+owners; legacy retains `query_as_owner`. Core rejects auth-disabled startup.
+Default order is stable ID ascending; core supports bounded registered sorts.
+Ordinary pages cap offset+limit at1000; source-disabled reference snapshots cap
+at5000. Legacy broad query/aggregation can still materialize bounded matches;
+cursors in both profiles retain references, not sources, and are invalidated
+by mutation or live policy changes rather than serving deleted/stale records.
 
 Delayed writes use a generation/version guard under the Storage lock; reset,
 newer versions and deletes cannot be undone by stale tasks. Engine refresh
@@ -685,9 +868,14 @@ helpers. This mirrors what a real client does against a deployment.
 # 1. start empty with WSL containers
 # If the quickstart container is still running, stop it first:
 wslc.exe stop osdu-well360
-wslc.exe run --rm -d --name osdu-well360 -p 8089:8089 \
+wslc.exe run --rm -d --name osdu-well360 --network osdu-lite-net -p 8089:8089 \
+  -e OPENSEARCH_URL=http://opensearch:9200 \
+  -e AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" \
   -e PRELOAD_FULL_SAMPLE=false ghcr.io/mehmetkadriumay/osdu-lite:latest
 curl --fail --retry 20 --retry-connrefused --retry-delay 1 http://localhost:8089/health
+# Explicitly empty an existing persisted partition (development data is deleted):
+curl --fail -X POST http://localhost:8089/poc/reset \
+  -H 'Authorization: Bearer demo-token' -H 'data-partition-id: company-prod'
 
 export OSDU_BASE_URL=http://localhost:8089 OSDU_PARTITION=company-prod OSDU_TOKEN=demo-token
 export AUTH="Authorization: Bearer $OSDU_TOKEN"

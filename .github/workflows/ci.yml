@@ -9,6 +9,13 @@ jobs:
     name: Server (tests + smoke)
     runs-on: ubuntu-latest
     services:
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+        ports:
+          - 127.0.0.1:10000:10000
+        options: >-
+          --health-cmd "node -e \"const s=require('net').connect(10000,'127.0.0.1');s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))\""
+          --health-interval 5s --health-timeout 3s --health-retries 12
       opensearch:
         image: opensearchproject/opensearch:3.9.0
         env:
@@ -35,7 +42,7 @@ jobs:
 
       - name: Syntax checks
         run: |
-          python -m py_compile server/server.py server/search_backend.py server/reference_services.py server/reference_extensions.py server/community_services.py server/community-smoke-test.py server/tests/test_reference_services.py server/tests/test_community_services.py
+          python -m py_compile server/server.py server/storage_backend.py server/runtime_jobs.py server/search_backend.py server/core_profile.py server/core_auth.py server/file_backend.py server/migrate_files.py server/reference_services.py server/reference_extensions.py server/community_services.py server/community-smoke-test.py server/tests/test_reference_services.py server/tests/test_community_services.py
           for f in demo-all.sh examples/well360/demo/*.sh server/*.sh examples/well360/client/*.sh; do
             bash -n "$f" || exit 1
           done
@@ -43,10 +50,24 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s server/tests -v
 
+      - name: Real Azurite persistence integration
+        run: |
+          export AZURITE_TEST_CONNECTION_STRING="$(PYTHONPATH=server python -c 'from storage_backend import AZURITE_CONNECTION_STRING; print(AZURITE_CONNECTION_STRING)')"
+          python -m unittest discover -s server/tests -p test_storage_backend.py -v
+          python -m unittest discover -s server/tests -p test_file_backend.py -v
+          PYTHONPATH=server:server/tests python -m unittest test_file_migration.RealFileMigrationTests -v
+          python -m unittest discover -s server/tests -p test_server.py -k TestRealLegacySampleHTTP -v
+
       - name: Real OpenSearch and public Indexer integration
         env:
           OPENSEARCH_TEST_URL: http://localhost:9200
         run: python -m unittest discover -s server/tests -p test_opensearch_integration.py -v
+
+      - name: Scoped real core mapping and Search acceptance
+        env:
+          OPENSEARCH_TEST_URL: http://localhost:9200
+          PYTHONPATH: server:server/tests
+        run: python -m unittest test_opensearch_integration.RealCoreSearchTests test_opensearch_integration.RealSchemaIndexTests -v
 
       - name: Live smoke test
         run: |
@@ -79,6 +100,9 @@ jobs:
           platforms: ${{ matrix.platform }}
           load: true
           tags: osdu-lite-reference:test
+      - name: Verify packaged core and offline migration modules (no backend startup)
+        run: |
+          docker run --rm --network none --platform "${{ matrix.platform }}" osdu-lite-reference:test python -c 'import core_profile, core_auth, file_backend, migrate_files; assert not migrate_files.parser().parse_args(["--manifest", "manifest.json"]).apply'
       - name: Actual offline conversion with bundled PROJ resources
         run: |
           docker run --rm --network none --platform "${{ matrix.platform }}" osdu-lite-reference:test python -c '

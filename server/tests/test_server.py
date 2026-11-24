@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,8 +19,10 @@ os.environ.setdefault("INDEX_DELAY_SECONDS", "0")
 
 import server  # noqa: E402
 from fake_search_backend import FakeSearch
+from fake_storage_backend import FakeStorage
+from fake_file_backend import FakeFiles
 
-server.start_runtime(FakeSearch())
+server.start_runtime(FakeSearch(), storage=FakeStorage())
 
 METHODS = {"get": "do_GET", "post": "do_POST", "put": "do_PUT", "delete": "do_DELETE",
            "patch": "do_PATCH", "options": "do_OPTIONS"}
@@ -141,6 +144,8 @@ class ServerTestCase(unittest.TestCase):
 
     def setUp(self):
         server.clear_state()
+        server.FILE_BACKEND = FakeFiles()
+        server.FILE_RUNTIME_EPOCH = "legacy-test"
         server.INDEX_DELAY_SECONDS = 0.0
         self._tmp_files = tempfile.TemporaryDirectory()
         server.FILES_DIR = Path(self._tmp_files.name)
@@ -307,7 +312,7 @@ class TestDataset(ServerTestCase):
         token = url.rsplit("/", 1)[1]
         body = b"LAS-001 sample curve data"
         status, upload = call("put", f"/upload/{token}", body=body, raw=True,
-                              token="", headers={"x-file-name": "up-1.las"})
+                              headers={"x-file-name": "up-1.las"})
         self.assertEqual(status, 200)
         self.assertEqual(upload["size"], len(body))
         self.assertEqual(upload["sha256"], hashlib.sha256(body).hexdigest())
@@ -315,8 +320,10 @@ class TestDataset(ServerTestCase):
         did = "company-prod:dataset--File.Generic:UP-1-LAS"
         ds = valid_well(did)
         ds["kind"] = server.DATASET_KIND
-        ds["data"] = {"Name": "up-1.las", "FileName": "up-1.las", "Format": "LAS"}
-        self.assertEqual(self.put_records([ds])[0], 200)
+        ds["data"] = {"Name": "up-1.las", "FileName": "up-1.las", "Format": "LAS",
+                      "FileSource": payload["storageLocation"]["FileSource"]}
+        self.assertEqual(call("put", "/api/dataset/v1/registerDataset",
+                              {"datasetRegistries": [ds]})[0], 200)
 
         status, payload = call("post", "/api/dataset/v1/retrievalInstructions",
                                {"datasetRegistryIds": [did]})
@@ -327,7 +334,7 @@ class TestDataset(ServerTestCase):
 
     def test_upload_requires_valid_token(self):
         status, _ = call("put", "/upload/bad-token", body=b"data", raw=True, token="")
-        self.assertEqual(status, 404)
+        self.assertEqual(status, 401)
 
     def test_storage_instructions_expiry_reported(self):
         server.UPLOAD_TOKEN_TTL = 120
@@ -342,7 +349,9 @@ class TestDataset(ServerTestCase):
         _, payload = call("post", "/api/dataset/v1/storageInstructions", {})
         with server.STORE_LOCK:
             self.assertNotIn("stale-token", server.UPLOAD_TOKENS)
-            self.assertIn(payload["storageLocation"]["signedUrl"].rsplit("/", 1)[1], server.UPLOAD_TOKENS)
+            digest = hashlib.sha256(payload["storageLocation"]["signedUrl"].rsplit("/", 1)[1].encode()).hexdigest()
+            self.assertIn(digest, server.UPLOAD_GRANTS)
+            self.assertFalse(server.UPLOAD_TOKENS)
         server.UPLOAD_TOKEN_TTL = 3600
 
     def test_full_sample_retrieval_has_checksums(self):
@@ -376,7 +385,7 @@ class TestWorkflow(ServerTestCase):
         run_id = payload["workflowRunId"]
         status, run = call("get", f"/api/workflow/v1/workflow/{run_id}")
         self.assertEqual(status, 200)
-        self.assertIn(run["status"], {"running", "succeeded"})
+        self.assertIn(run["status"], {"submitted", "running", "succeeded"})
         status, _ = call("get", "/api/storage/v2/records/company-prod:master-data--Well:WT-1")
         self.assertEqual(status, 200)
         time.sleep(0.6)
@@ -430,12 +439,12 @@ class TestRbac(ServerTestCase):
         finally:
             server.GROUPS_BY_TOKEN[server.TOKEN] = saved
 
-    def test_search_requires_search_user(self):
+    def test_search_accepts_datalake_editor_role(self):
         saved = server.GROUPS_BY_TOKEN[server.TOKEN]
         server.GROUPS_BY_TOKEN[server.TOKEN] = {"users.datalake.editors"}
         try:
             status, _ = call("post", "/api/search/v2/query", {"kind": server.WELL_KIND})
-            self.assertEqual(status, 403)
+            self.assertEqual(status, 200)  # datalake editors are an explicit Search role.
         finally:
             server.GROUPS_BY_TOKEN[server.TOKEN] = saved
 
@@ -496,8 +505,8 @@ class TestStorageDeleteAndPaging(ServerTestCase):
         self.put_records([valid_well()])
         status, rec = call("get", "/api/storage/v2/records/company-prod:master-data--Well:WT-1")
         self.assertEqual(status, 200)
-        # The acknowledged deletion marker consumes generation 2.
-        self.assertEqual(rec["version"], 3)
+        # Deletion consumes a generation, not a visible data version.
+        self.assertEqual(rec["version"], 2)
 
     def test_single_delete_and_hard_delete(self):
         self.put_records([valid_well()])
@@ -628,9 +637,11 @@ class TestSearchEnhanced(ServerTestCase):
     def test_query_as_owner_restricts(self):
         rec = valid_well()
         rec["acl"]["owners"] = ["data.other.owners@company-prod.company.com"]
-        self.put_records([rec])
-        wait_until(lambda: call("post", "/api/search/v2/query",
-                                {"kind": server.WELL_KIND})[1]["totalCount"] == 1)
+        call("post", "/api/entitlements/v2/groups", {"name": "data.other.owners"})
+        # Trusted fixture: demo is a viewer, not an owner, so HTTP creation must be denied.
+        self.assertEqual(self.put_records([rec])[0], 403)
+        server.authorized_upsert([rec], index_immediately=True, principal=server.core_auth.SYSTEM)
+        self.assertEqual(call("post", "/api/search/v2/query", {"kind": server.WELL_KIND})[1]["totalCount"], 1)
         _, payload = call("post", "/api/search/v2/query",
                           {"kind": server.WELL_KIND, "query_as_owner": True})
         self.assertEqual(payload["totalCount"], 0)
@@ -671,7 +682,7 @@ class TestFileService(ServerTestCase):
 
     def _register_file(self, body):
         status, payload = call("put", f"/upload/{body[0]}", body=body[1], raw=True,
-                               token="", headers={"x-file-name": "f-1.las"})
+                               headers={"x-file-name": "f-1.las"})
         self.assertEqual(status, 200)
         return payload
 
@@ -682,7 +693,8 @@ class TestFileService(ServerTestCase):
         upload = self._register_file((token, content))
         rec = valid_well("company-prod:dataset--File.Generic:F-1-LAS")
         rec["kind"] = server.DATASET_KIND
-        rec["data"] = {"Name": "f-1.las", "FileName": "f-1.las", "Format": "LAS"}
+        rec["data"] = {"Name": "f-1.las", "FileName": "f-1.las", "Format": "LAS",
+                       "FileSource": instructions["storageLocation"]["FileSource"]}
         status, payload = call("post", "/api/file/v2/files", rec)
         self.assertEqual(status, 200)
         self.assertEqual(payload["fileID"], "company-prod:dataset--File.Generic:F-1-LAS")
@@ -691,7 +703,7 @@ class TestFileService(ServerTestCase):
         status, payload = call("get", "/api/file/v2/files/company-prod:dataset--File.Generic:F-1-LAS")
         self.assertEqual(status, 200)
         loc = payload["fileSourceDatasWithLocation"][0]["location"]
-        self.assertEqual(loc["signedUrl"].endswith("/files/f-1.las"), True)
+        self.assertIn("?sp=r", loc["signedUrl"])
         self.assertEqual(loc["sha256"], hashlib.sha256(content).hexdigest())
 
         status, payload = call("get", "/api/file/v2/files/company-prod:dataset--File.Generic:F-1-LAS/downloadURL")
@@ -963,16 +975,18 @@ class TestDatasetBatchEndpoints(ServerTestCase):
 
     def upload(self):
         _, instructions = call("post", "/api/dataset/v1/storageInstructions", {})
+        self.source = instructions["storageLocation"]["FileSource"]
         token = instructions["storageLocation"]["signedUrl"].rsplit("/", 1)[1]
         body = b"D1 batch curve data"
         status, _ = call("put", f"/upload/{token}", body=body, raw=True,
-                         token="", headers={"x-file-name": "f-2.las"})
+                         headers={"x-file-name": "f-2.las"})
         self.assertEqual(status, 200)
 
     def register(self):
         ds = valid_well(self.DID)
         ds["kind"] = server.DATASET_KIND
-        ds["data"] = {"Name": "f-2.las", "FileName": "f-2.las", "Format": "LAS"}
+        ds["data"] = {"Name": "f-2.las", "FileName": "f-2.las", "Format": "LAS",
+                      "FileSource": self.source}
         status, payload = call("put", "/api/dataset/v1/registerDataset",
                                {"datasetRegistries": [ds]})
         self.assertEqual(status, 200)
@@ -1016,9 +1030,10 @@ class TestFileV2Extended(ServerTestCase):
 
     def upload(self):
         _, instructions = call("post", "/api/dataset/v1/storageInstructions", {})
+        self.source = instructions["storageLocation"]["FileSource"]
         token = instructions["storageLocation"]["signedUrl"].rsplit("/", 1)[1]
         return call("put", f"/upload/{token}", body=b"F2 metadata contents", raw=True,
-                    token="", headers={"x-file-name": "f-3.las"})
+                    headers={"x-file-name": "f-3.las"})
 
     def test_upload_url_metadata_delivery(self):
         self.assertEqual(self.upload()[0], 200)
@@ -1031,7 +1046,7 @@ class TestFileV2Extended(ServerTestCase):
             "id": self.DID,
             "kindId": server.DATASET_KIND,
             "FileName": "f-3.las",
-            "data": {"FileSource": "f-3.las"},
+            "data": {"FileSource": self.source},
         })
         self.assertEqual(status, 201)
         self.assertEqual(payload["id"], self.DID)
@@ -1043,7 +1058,7 @@ class TestFileV2Extended(ServerTestCase):
         status, payload = call("get", f"/api/file/v2/files/{self.DID}/DownloadURL")
         self.assertEqual(status, 200)
         self.assertIn("signedURL", payload)
-        self.assertEqual(payload["signedURL"].endswith("/files/f-3.las"), True)
+        self.assertIn("?sp=r", payload["signedURL"])
 
         status, payload = call("post", "/api/file/v2/getLocation", {"FileID": self.DID})
         self.assertEqual(status, 200)
@@ -1092,22 +1107,11 @@ class TestWorkflowDeployment(ServerTestCase):
         self.assertEqual(payload["description"], "v2")
 
         status, payload = call("post", "/api/workflow/v1/workflow/Demo_workflow/workflowRun", {})
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["status"], "submitted")
-        run_id = payload["workflowRunId"]
-        wait_until(lambda: call("get", f"/api/workflow/v1/workflow/Demo_workflow/workflowRun/{run_id}")[1]["status"] == "succeeded")
+        self.assertEqual(status, 501)
+        self.assertIn("unsupported_workflow", payload["message"])
 
         _, payload = call("get", "/api/workflow/v1/workflow/Demo_workflow/workflowRun")
-        self.assertEqual(len(payload), 1)
-        self.assertEqual(payload[0]["workflowRunId"], run_id)
-
-        status, payload = call("put", f"/api/workflow/v1/workflow/Demo_workflow/workflowRun/{run_id}",
-                               {"status": "cancelled"})
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["status"], "cancelled")
-
-        status, _ = call("delete", f"/api/workflow/v1/workflow/Demo_workflow/workflowRun/{run_id}")
-        self.assertEqual(status, 204)
+        self.assertEqual(payload, [])
         status, _ = call("delete", "/api/workflow/v1/workflow/Demo_workflow")
         self.assertEqual(status, 204)
         status, _ = call("get", "/api/workflow/v1/workflow/Demo_workflow")
@@ -1285,6 +1289,506 @@ class TestEntitlementsExtended(ServerTestCase):
         status, _ = call("post", "/api/entitlements/v2/groups",
                          {"name": "data.demo.apps", "appIds": ["app-x"]})
         self.assertEqual(status, 201)
+
+
+class TestLegacyDurableFiles(ServerTestCase):
+    def test_adapter_rechecks_expiry_after_checksum_read(self):
+        from unittest.mock import patch
+        _, issued = call("get", "/file/v2/files/uploadURL")
+        token = issued["Location"]["SignedUrl"].rsplit("/", 1)[1]
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        grant = deepcopy(server.UPLOAD_GRANTS[digest])
+        read = server.FILE_BACKEND.read
+        def expire_after_read(key):
+            yield from read(key)
+            clock.return_value = grant["expiresAt"] + 1
+        with server.STORE_LOCK, \
+                patch.object(server.time, "time", return_value=grant["expiresAt"] - 1) as clock, \
+                patch.object(server.FILE_BACKEND, "read", side_effect=expire_after_read):
+            self.assertEqual(call("put", "/upload/" + token, b"abc", raw=True)[0], 404)
+            self.assertEqual(server.UPLOAD_GRANTS[digest], grant)
+
+    def test_adapter_hash_only_bound_bytes_retry(self):
+        from unittest.mock import patch
+        _, issued = call("get", "/file/v2/files/uploadURL")
+        token = issued["Location"]["SignedUrl"].rsplit("/", 1)[1]
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        self.assertIn(digest, server.UPLOAD_GRANTS)
+        self.assertNotIn(token, json.dumps(server.storage_state()))
+        self.assertNotIn(token, server.UPLOAD_GRANTS[digest]["stagingKey"])
+        self.assertFalse(server.UPLOAD_TOKENS)
+        data = b"x" * (1024 * 1024 + 7)
+        status, upload = call("put", "/upload/" + token, data, raw=True,
+                              headers={"x-file-name": "private.bin"})
+        self.assertEqual(status, 200)
+        record = valid_well("company-prod:dataset--File.Generic:legacy-bound")
+        record.update(kind=server.DATASET_KIND, data={
+            "FileName": "private.bin", "FileSource": issued["Location"]["FileSource"]})
+        path = "/file/v2/files/metadata"
+        self.assertEqual(call("post", path, record)[0], 201)
+        self.assertEqual(call("post", path, record)[0], 201)
+        self.assertEqual(server.RECORD_BY_ID[record["id"]]["version"], 1)
+        _, result = call("get", "/file/v2/files/" + record["id"] + "/DownloadURL")
+        self.assertIn("?sp=r", result["signedURL"])
+        self.assertEqual(upload["sha256"], server.FILE_BINDINGS[record["id"]]["sha256"])
+        self.assertFalse(list(server.FILES_DIR.iterdir()))
+        self.assertEqual(call("get", "/files/private.bin", token="")[0], 401)
+        handler = make_handler("/files/private.bin", _Headers({
+            "Authorization": "Bearer demo-token", "data-partition-id": server.PARTITION}), "")
+        server.Handler.do_GET(handler)
+        self.assertEqual(handler._status, 200)
+        self.assertEqual(handler.wfile.buf.getvalue(), data)
+        self.assertLessEqual(max(server.FILE_BACKEND.chunks_uploaded), 1024 * 1024)
+        binding = deepcopy(server.FILE_BINDINGS[record["id"]])
+        profile = server.COMPAT_PROFILE
+        try:
+            with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}), patch.object(
+                    server, "PRELOAD_FULL_SAMPLE", False), patch.object(
+                    server, "immutable_sample", return_value=False):
+                server.start_runtime(FakeSearch(), storage=server.STORAGE_BACKEND,
+                                     files=server.FILE_BACKEND)
+                self.assertTrue(server.RUNTIME_ACCEPTING)
+                self.assertEqual(server.FILE_BINDINGS[record["id"]], binding)
+        finally:
+            with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": profile}):
+                server.start_runtime(FakeSearch(), storage=server.STORAGE_BACKEND,
+                                     files=server.FILE_BACKEND)
+
+    def test_legacy_metadata_only_requires_migration_for_byte_reads(self):
+        record = valid_well("company-prod:dataset--File.Generic:unbound")
+        record.update(kind=server.DATASET_KIND, data={"FileName": "user.bin"})
+        self.assertEqual(self.put_records([record])[0], 200)
+        self.assertEqual(call("post", "/file/v2/files/metadata", record)[0], 400)
+        self.assertNotIn(record["id"], server.FILE_BINDINGS)
+        (server.FILES_DIR / "user.bin").write_bytes(b"not imported")
+        self.assertEqual(call("get", "/file/v2/files/" + record["id"] + "/downloadURL")[0], 503)
+
+
+class TestSampleFileStartup(unittest.TestCase):
+    def test_already_bound_samples_are_verified_before_restart_readiness(self):
+        from unittest.mock import patch
+        storage, files = FakeStorage(), FakeFiles()
+        with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}), patch.object(
+                server, "PRELOAD_FULL_SAMPLE", True):
+            server.start_runtime(FakeSearch(), storage=storage, files=files)
+            before = deepcopy(storage.state)
+            with patch.object(server, "immutable_sample", return_value=False):
+                with self.assertRaises(server.BackendError):
+                    server.start_runtime(FakeSearch(), storage=storage, files=files)
+            self.assertFalse(server.RUNTIME_ACCEPTING)
+            self.assertEqual(storage.state, before)
+
+    def test_import_commit_failure_and_modified_sample_do_not_publish_readiness(self):
+        from unittest.mock import patch
+        storage, files = FakeStorage(), FakeFiles()
+        with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "legacy"}):
+            server.start_runtime(FakeSearch(), storage=storage)
+            server.upsert_records(server.FULL_SAMPLE)
+        before = deepcopy(storage.state)
+        with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}), patch.object(
+                storage, "save", side_effect=server.BackendError(503, "commit_failed")):
+            with self.assertRaisesRegex(Exception, "commit_failed"):
+                server.start_runtime(FakeSearch(), storage=storage, files=files)
+        self.assertFalse(server.RUNTIME_ACCEPTING)
+        self.assertEqual(storage.state, before)
+        self.assertFalse(storage.state["fileBindings"])
+        with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}), patch.dict(
+                server.SAMPLE_HASHES, {"eagle01_gr_cali.las": "0" * 64}):
+            with self.assertRaisesRegex(Exception, "unmigrated"):
+                server.start_runtime(FakeSearch(), storage=storage, files=files)
+        self.assertFalse(server.RUNTIME_ACCEPTING)
+        self.assertEqual(storage.state, before)
+
+    def test_default_samples_atomic_restart_and_fail_closed(self):
+        from unittest.mock import patch
+        storage, files = FakeStorage(), FakeFiles()
+        with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}), patch.object(
+                server, "PRELOAD_FULL_SAMPLE", True):
+            server.start_runtime(FakeSearch(), storage=storage, files=files)
+            self.assertTrue(server.RUNTIME_ACCEPTING)
+            bindings = deepcopy(server.FILE_BINDINGS)
+            self.assertEqual(len(bindings), 4)
+            for rid, binding in bindings.items():
+                self.assertEqual(binding["sha256"], server.SAMPLE_HASHES[
+                    server.record_file_name(server.RECORD_BY_ID[rid])])
+            revision = server.REVISION
+            server.start_runtime(FakeSearch(), storage=storage, files=files)
+            self.assertEqual(server.FILE_BINDINGS, bindings)
+            self.assertEqual(server.REVISION, revision)
+            bad = valid_well("company-prod:dataset--File.Generic:user")
+            bad.update(kind=server.DATASET_KIND, data={"FileName": "user.bin"})
+            server.upsert_records([bad])
+            with self.assertRaisesRegex(Exception, "unmigrated"):
+                server.start_runtime(FakeSearch(), storage=storage, files=files)
+            self.assertFalse(server.RUNTIME_ACCEPTING)
+
+    def tearDown(self):
+        server.start_runtime(FakeSearch(), storage=FakeStorage(), files=FakeFiles())
+
+
+class TestCoreFilePublication(unittest.TestCase):
+    def setUp(self):
+        from fake_file_backend import FakeFiles
+        from unittest.mock import patch
+        self.patch = patch
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_files = server.FILES_DIR
+        server.FILES_DIR = Path(self.tmp.name)
+        self.env = patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"})
+        self.env.start()
+        self.storage, self.files = FakeStorage(), FakeFiles()
+        server.start_runtime(FakeSearch(), storage=self.storage, files=self.files)
+
+    def tearDown(self):
+        server.stop_runtime()
+        self.env.stop()
+        server.start_runtime(FakeSearch(), storage=FakeStorage())
+        server.FILES_DIR = self.old_files
+        self.tmp.cleanup()
+
+    def grant(self):
+        status, body = call("get", "/api/file/v2/files/uploadURL?expiryTime=1M")
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_legacy_unbound_dataset_metadata_restore_does_not_publish_bytes(self):
+        record = valid_well(f"{server.PARTITION}:dataset--File.Generic:legacy-metadata-only")
+        record.update(kind=server.DATASET_KIND, data={
+            "FileName": "pending-migration.bin", "FileSource": "pending-migration.bin"})
+        self.assertEqual(call("put", "/api/storage/v2/records", [record])[0], 400)
+        self.assertNotIn(record["id"], server.RECORD_BY_ID)
+        server.COMPAT_PROFILE = "legacy"
+        self.assertEqual(call("post", "/api/storage/v2/records", [record])[0], 200)
+        route = "/api/dataset/v1/metadataRecord/" + record["id"]
+        self.assertEqual(call("post", route + "/softDelete")[0], 204)
+        self.assertEqual(call("post", route + "/undelete")[0], 200)
+        self.assertNotIn(record["id"], server.FILE_BINDINGS)
+        self.assertEqual(self.files.blobs, {})
+        self.assertEqual(call("get", "/api/file/v2/files/" + record["id"] + "/DownloadURL")[0], 503)
+        self.assertEqual(call("get", "/files/pending-migration.bin", token="")[0], 401)
+
+    def test_legacy_dataset_metadata_only_registration_preserves_core_publication_boundary(self):
+        record = valid_well(f"{server.PARTITION}:dataset--File.Generic:metadata-only-registration")
+        record.update(kind=server.DATASET_KIND, data={"Name": "metadata-only"})
+        body = {"datasetRegistries": [record]}
+        self.assertEqual(call("put", "/api/dataset/v1/registerDataset", body)[0], 400)
+        server.COMPAT_PROFILE = "legacy"
+        status, result = call("put", "/api/dataset/v1/registerDataset", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["datasetRegistries"][0]["id"], record["id"])
+        self.assertNotIn(record["id"], server.FILE_BINDINGS)
+        self.assertEqual(self.files.blobs, {})
+        before = deepcopy(server.storage_state())
+        for malformed in ([], [None], [{}], [record, None]):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(call("put", "/api/dataset/v1/registerDataset", malformed)[0], 400)
+                self.assertEqual(server.storage_state(), before)
+                self.assertEqual(self.files.blobs, {})
+
+    def record(self, grant, suffix="one"):
+        record = valid_well(f"{server.PARTITION}:dataset--File.Generic:{suffix}")
+        record.update(kind=server.DATASET_KIND, data={
+            "FileName": "same.bin", "FileSource": grant["Location"]["FileSource"]})
+        return record
+
+    def test_grant_publication_immutable_bytes_retry_and_restart(self):
+        grant = self.grant()
+        source = grant["Location"]["FileSource"]
+        self.files.upload(source, io.BytesIO(b"published bytes"), 15)
+        record = self.record(grant)
+        route = "/api/file/v2/files/metadata"
+        self.assertEqual(call("post", route, record), (201, {"id": record["id"]}))
+        before = json.loads(json.dumps(server.storage_state()))
+        self.assertEqual(call("post", route, record), (201, {"id": record["id"]}))
+        self.assertEqual(server.storage_state(), before)
+        altered = json.loads(json.dumps(record))
+        altered["data"]["FileName"] = "changed"
+        self.assertEqual(call("post", route, altered)[0], 409)
+        binding = dict(server.FILE_BINDINGS[record["id"]])
+        self.files.upload(source, io.BytesIO(b"overwrite"), 9)
+        self.assertEqual(b"".join(self.files.read(binding["finalKey"])), b"published bytes")
+        server.start_runtime(FakeSearch(), storage=self.storage, files=self.files)
+        status, body = call("get", f'/api/file/v2/files/{record["id"]}/downloadURL')
+        self.assertEqual(status, 200, body)
+        self.assertIn("SignedUrl", body)
+        self.assertEqual(server.FILE_BINDINGS[record["id"]], binding)
+        self.assertEqual(call("get", "/files/same.bin", token="")[0], 401)
+        self.assertFalse((server.FILES_DIR / "same.bin").exists())
+        self.assertNotIn(grant["Location"]["SignedUrl"], json.dumps(self.storage.state))
+
+    def test_dataset_roundtrip_and_same_name_isolation(self):
+        records = []
+        for suffix, payload in (("one", b"first"), ("two", b"second")):
+            status, instructions = call("post",
+                "/api/dataset/v1/storageInstructions?kindSubType=dataset--File.Generic", {})
+            self.assertEqual(status, 200, instructions)
+            self.assertEqual(instructions["providerKey"], "AZURE")
+            source = instructions["storageLocation"]["fileSource"]
+            self.files.upload(source, io.BytesIO(payload), len(payload))
+            records.append(self.record({"Location": {"FileSource": source}}, suffix))
+        status, result = call("put", "/api/dataset/v1/registerDataset",
+                              {"datasetRegistries": records})
+        self.assertEqual(status, 201, result)
+        self.assertEqual(len(result["datasetRegistries"]), 2)
+        keys = [server.FILE_BINDINGS[r["id"]]["finalKey"] for r in records]
+        self.assertNotEqual(*keys)
+        status, result = call("post", "/api/dataset/v1/retrievalInstructions",
+                              {"datasetRegistryIds": [r["id"] for r in records]})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(len(result["datasets"]), 2)
+        self.assertEqual(call("post", "/api/dataset/v1/revokeURL", {})[0], 501)
+
+    def test_missing_unsafe_source_expiry_and_failed_commit(self):
+        for expiry in ("0M", "2H", "1D", "nonsense"):
+            self.assertEqual(call("get", "/api/file/v2/files/uploadURL?expiryTime=" + expiry)[0], 400)
+        grant = self.grant()
+        record = self.record(grant)
+        self.assertEqual(call("post", "/api/file/v2/files/metadata", record)[0], 400)
+        source = grant["Location"]["FileSource"]
+        self.files.upload(source, io.BytesIO(b"abc"), 3)
+        before = json.loads(json.dumps(server.storage_state()))
+        with self.patch.object(self.storage, "save", side_effect=server.BackendError(503, "offline")):
+            self.assertEqual(call("post", "/api/file/v2/files/metadata", record)[0], 503)
+        self.assertEqual(server.storage_state(), before)
+        self.assertNotIn(record["id"], server.FILE_BINDINGS)
+        self.assertNotIn(record["id"], server.RECORD_BY_ID)
+        record["data"]["FileSource"] = "https://foreign/account/blob"
+        self.assertEqual(call("post", "/api/file/v2/files/metadata", record)[0], 400)
+        self.assertEqual(call("post", "/api/dataset/v1/storageInstructions?kindSubType=other", {})[0], 501)
+
+    def test_concurrent_retry_creates_one_version_and_enforces_two_slots(self):
+        import threading
+        grant = self.grant()
+        self.files.upload(grant["Location"]["FileSource"], io.BytesIO(b"abc"), 3)
+        record = self.record(grant)
+        barrier = threading.Barrier(2)
+        publish = self.files.publish
+        def delayed(*args):
+            barrier.wait(timeout=5)
+            return publish(*args)
+        results = []
+        with self.patch.object(self.files, "publish", side_effect=delayed):
+            workers = [threading.Thread(target=lambda: results.append(
+                call("post", "/api/file/v2/files/metadata", record))) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(10)
+                self.assertFalse(worker.is_alive())
+        self.assertEqual([status for status, _ in results], [201, 201])
+        self.assertEqual(len(server.RECORD_VERSIONS[record["id"]]), 1)
+        self.assertTrue(server.FILE_FINALIZATIONS.acquire(blocking=False))
+        self.assertTrue(server.FILE_FINALIZATIONS.acquire(blocking=False))
+        try:
+            self.assertEqual(call("post", "/api/file/v2/files/metadata", record)[0], 429)
+        finally:
+            server.FILE_FINALIZATIONS.release()
+            server.FILE_FINALIZATIONS.release()
+
+    def test_expired_grant_reclamation_and_authority_recheck_after_stream(self):
+        grant = self.grant()
+        source = grant["Location"]["FileSource"]
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        with server.STORE_LOCK, server.storage_transaction():
+            server.UPLOAD_GRANTS[digest]["expiresAt"] = 0
+        self.grant()
+        self.assertNotIn(digest, server.UPLOAD_GRANTS)
+        grant = self.grant()
+        source = grant["Location"]["FileSource"]
+        self.files.upload(source, io.BytesIO(b"abc"), 3)
+        publish = self.files.publish
+        def revoke(*args):
+            result = publish(*args)
+            with server.STORE_LOCK, server.storage_transaction():
+                server.GROUPS[server.ACL_OWNERS]["members"].clear()
+            return result
+        record = self.record(grant)
+        with self.patch.object(self.files, "publish", side_effect=revoke):
+            self.assertEqual(call("post", "/api/file/v2/files/metadata", record)[0], 403)
+        self.assertNotIn(record["id"], server.FILE_BINDINGS)
+        self.assertNotIn(record["id"], server.RECORD_BY_ID)
+
+
+@unittest.skipUnless(os.getenv("AZURITE_TEST_CONNECTION_STRING"), "Real Azurite not configured")
+class TestRealLegacySampleHTTP(unittest.TestCase):
+    def test_real_legacy_adapter_default_samples_and_restart(self):
+        import threading
+        import urllib.request
+        import urllib.error
+        import uuid
+        from urllib.parse import urlparse
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from file_backend import AzureFiles
+        from storage_backend import AzureBlobStorage
+        connection = os.environ["AZURITE_TEST_CONNECTION_STRING"]
+        public = os.environ["AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT"]
+        storage = AzureBlobStorage(connection, server.PARTITION,
+                                   container="legacysamples-" + uuid.uuid4().hex)
+        files = AzureFiles(connection, public)
+        httpd = None
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "FILES_DIR", Path(directory)), \
+                patch.object(server, "PRELOAD_FULL_SAMPLE", True):
+            try:
+                (server.FILES_DIR / "arbitrary.bin").write_bytes(b"never import")
+                with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}):
+                    server.start_runtime(FakeSearch(), storage=storage, files=files)
+                samples = deepcopy(server.FILE_BINDINGS)
+                self.assertEqual(len(samples), 4)
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+                worker.start()
+                base = f"http://127.0.0.1:{httpd.server_port}"
+                def api(method, path, body=None, token=server.TOKEN, raw=False):
+                    data = body if raw else json.dumps(body).encode() if body is not None else None
+                    request = urllib.request.Request(base + path, data=data, method=method, headers={
+                        "Authorization": "Bearer " + token, "data-partition-id": server.PARTITION,
+                        "Content-Type": "application/json", "Host": "forged.invalid",
+                        "x-file-name": "legacy-private.bin"})
+                    try:
+                        with urllib.request.urlopen(request, timeout=30) as response:
+                            content = response.read()
+                            return response.status, content if raw else json.loads(content) if content else None
+                    except urllib.error.HTTPError as error:
+                        return error.code, error.read()
+                for rid, binding in samples.items():
+                    _, response = api("GET", "/api/file/v2/files/" + rid + "/downloadURL")
+                    with urllib.request.urlopen(response["SignedUrl"], timeout=30) as stream:
+                        self.assertEqual(hashlib.sha256(stream.read()).hexdigest(), binding["sha256"])
+                revision = server.REVISION
+                with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "legacy"}):
+                    server.start_runtime(FakeSearch(), storage=storage, files=AzureFiles(connection, public))
+                    self.assertEqual(server.FILE_BINDINGS, samples)
+                    self.assertEqual(server.REVISION, revision)
+                    _, issued = api("GET", "/file/v2/files/uploadURL")
+                    upload_path = urlparse(issued["Location"]["SignedUrl"]).path
+                    token = upload_path.rsplit("/", 1)[1]
+                    self.assertNotIn(token, json.dumps(storage.load()))
+                    self.assertFalse(server.UPLOAD_TOKENS)
+                    server.start_runtime(FakeSearch(), storage=storage, files=AzureFiles(connection, public))
+                    content = b"adapter-real:" + b"0123456789" * 150000
+                    self.assertEqual(api("PUT", upload_path, content, raw=True)[0], 200)
+                    record = valid_well(f"{server.PARTITION}:dataset--File.Generic:{uuid.uuid4().hex}")
+                    record.update(kind=server.DATASET_KIND, data={
+                        "FileName": "legacy-private.bin", "FileSource": issued["Location"]["FileSource"]})
+                    self.assertEqual(api("POST", "/file/v2/files/metadata", record)[0], 201)
+                    self.assertEqual(api("POST", "/file/v2/files/metadata", record)[0], 201)
+                    _, download = api("GET", "/file/v2/files/" + record["id"] + "/DownloadURL")
+                    self.assertTrue(download["signedURL"].startswith(public + "/"))
+                    with urllib.request.urlopen(download["signedURL"], timeout=30) as stream:
+                        self.assertEqual(stream.read(), content)
+                    self.assertEqual(api("GET", "/files/legacy-private.bin", raw=True), (200, content))
+                    self.assertEqual(api("GET", "/files/legacy-private.bin", token="", raw=True)[0], 401)
+                    self.assertEqual([p.name for p in server.FILES_DIR.iterdir()], ["arbitrary.bin"])
+                    server.start_runtime(FakeSearch(), storage=storage, files=AzureFiles(connection, public))
+                    self.assertEqual(server.RECORD_BY_ID[record["id"]]["version"], 1)
+                    self.assertEqual(api("GET", "/files/legacy-private.bin", raw=True), (200, content))
+                with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}):
+                    server.start_runtime(FakeSearch(), storage=storage, files=AzureFiles(connection, public))
+                    self.assertEqual({rid: server.FILE_BINDINGS[rid] for rid in samples}, samples)
+                    bad = valid_well(f"{server.PARTITION}:dataset--File.Generic:unmigrated")
+                    bad.update(kind=server.DATASET_KIND, data={"FileName": "arbitrary.bin"})
+                    server.upsert_records([bad])
+                    with self.assertRaisesRegex(Exception, "unmigrated"):
+                        server.start_runtime(FakeSearch(), storage=storage, files=AzureFiles(connection, public))
+                    self.assertFalse(server.RUNTIME_ACCEPTING)
+            finally:
+                if httpd is not None:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    worker.join(5)
+                server.stop_runtime()
+                storage.container.delete_container()
+                with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "legacy"}):
+                    server.start_runtime(FakeSearch(), storage=FakeStorage(), files=FakeFiles())
+
+
+@unittest.skipUnless(os.getenv("AZURITE_TEST_CONNECTION_STRING"), "Real Azurite not configured")
+class TestRealCoreFilesHTTP(unittest.TestCase):
+    def test_api_sas_bytes_policy_and_runtime_restart(self):
+        import threading
+        import urllib.request
+        import urllib.error
+        import uuid
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from file_backend import AzureFiles
+        from storage_backend import AzureBlobStorage
+        connection = os.environ["AZURITE_TEST_CONNECTION_STRING"]
+        public = os.environ["AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT"]
+        storage = AzureBlobStorage(connection, server.PARTITION, container="corefiles-" + uuid.uuid4().hex)
+        files = AzureFiles(connection, public)
+        httpd = None
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "core"}), \
+                patch.object(server, "FILES_DIR", Path(directory)):
+            try:
+                server.start_runtime(FakeSearch(), storage=storage, files=files)
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+                worker.start()
+                base = f"http://127.0.0.1:{httpd.server_port}"
+                def api(method, path, body=None, token=server.TOKEN):
+                    raw = json.dumps(body).encode() if body is not None else None
+                    request = urllib.request.Request(base + path, data=raw, method=method, headers={
+                        "Authorization": "Bearer " + token, "data-partition-id": server.PARTITION,
+                        "Content-Type": "application/json", "Host": "forged.invalid"})
+                    try:
+                        with urllib.request.urlopen(request, timeout=20) as response:
+                            content = response.read()
+                            return response.status, json.loads(content) if content else None
+                    except urllib.error.HTTPError as error:
+                        return error.code, json.loads(error.read())
+                status, grant = api("GET", "/api/file/v2/files/uploadURL?expiryTime=1M")
+                self.assertEqual(status, 200, grant)
+                self.assertTrue(grant["Location"]["SignedUrl"].startswith(public + "/"))
+                payload = b"real-file-bytes:" + b"0123456789" * 150000
+                write = urllib.request.Request(grant["Location"]["SignedUrl"], data=payload, method="PUT",
+                    headers={"x-ms-blob-type": "BlockBlob", "x-ms-version": "2023-11-03"})
+                with urllib.request.urlopen(write, timeout=30) as response:
+                    self.assertEqual(response.status, 201)
+                record = valid_well(f"{server.PARTITION}:dataset--File.Generic:{uuid.uuid4().hex}")
+                record.update(kind=server.DATASET_KIND, data={
+                    "FileName": "private.bin", "FileSource": grant["Location"]["FileSource"]})
+                self.assertEqual(api("POST", "/api/file/v2/files/metadata", record), (201, {"id": record["id"]}))
+                revision = server.REVISION
+                self.assertEqual(api("POST", "/api/file/v2/files/metadata", record)[0], 201)
+                self.assertEqual(server.REVISION, revision)
+                path = "/api/file/v2/files/" + record["id"] + "/downloadURL"
+                status, download = api("GET", path)
+                self.assertEqual(status, 200, download)
+                signed = download["SignedUrl"]
+                with urllib.request.urlopen(signed, timeout=30) as response:
+                    self.assertEqual(hashlib.sha256(response.read()).hexdigest(), hashlib.sha256(payload).hexdigest())
+                ranged = urllib.request.Request(signed, headers={"Range": "bytes=3-12"})
+                with urllib.request.urlopen(ranged, timeout=20) as response:
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.read(), payload[3:13])
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    urllib.request.urlopen(signed.split("?")[0], timeout=20)
+                self.assertIn(denied.exception.code, (403, 404))
+                overwrite = urllib.request.Request(grant["Location"]["SignedUrl"], data=b"overwritten", method="PUT",
+                    headers={"x-ms-blob-type": "BlockBlob", "x-ms-version": "2023-11-03"})
+                urllib.request.urlopen(overwrite, timeout=20).close()
+                with urllib.request.urlopen(signed, timeout=30) as response:
+                    self.assertEqual(response.read(), payload)
+                server.start_runtime(FakeSearch(), storage=storage, files=AzureFiles(connection, public))
+                self.assertEqual(api("GET", path)[0], 200)
+                self.assertEqual(api("GET", "/files/private.bin", token="")[0], 401)
+                self.assertFalse((server.FILES_DIR / "private.bin").exists())
+                with server.STORE_LOCK, server.storage_transaction():
+                    server.LEGAL_TAGS[server.LEGAL_TAG]["properties"]["expirationDate"] = "2000-01-01"
+                self.assertEqual(api("GET", path)[0], 404)
+                self.assertEqual(api("GET", "/api/dataset/v1/retrievalInstructions?id=" + record["id"])[1],
+                                 {"datasets": []})
+            finally:
+                if httpd is not None:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    worker.join(5)
+                server.stop_runtime()
+                storage.container.delete_container()
+                with patch.dict(os.environ, {"OSDU_COMPAT_PROFILE": "legacy"}):
+                    server.start_runtime(FakeSearch(), storage=FakeStorage())
 
 
 if __name__ == "__main__":

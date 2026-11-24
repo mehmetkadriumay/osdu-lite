@@ -9,26 +9,37 @@ class FakeSearch:
     def __init__(self):
         self.documents = {}
         self.generations = {}
+        self.indices = {}
+        self.registry = None
+
+    def configure_registry(self, registry):
+        self.registry = registry
 
     def start_epoch(self, epoch):
         self.reset()
 
-    def provision(self):
-        pass
+    def provision(self, kinds=None):
+        for kind in kinds or ():
+            self.indices[kind] = self.registry.mapping(kind)
+        return False
+
+    def provision_kinds(self, kinds):
+        return self.provision(kinds)
 
     def reset(self):
         self.documents.clear()
         self.generations.clear()
+        self.indices.clear()
 
     def bulk(self, records):
         outcomes = []
         for record in records:
-            rid, generation = record["id"], record["version"]
+            rid, generation = record["id"], record.get("_generation", record["version"])
             if generation < self.generations.get(rid, 0):
                 outcomes.append(Outcome(False, False, "superseded"))
             else:
                 self.generations[rid] = generation
-                self.documents[rid] = deepcopy(record)
+                self.documents[rid] = deepcopy({k: v for k, v in record.items() if k != "_generation"})
                 outcomes.append(Outcome())
         return outcomes
 
@@ -75,3 +86,33 @@ class FakeSearch:
                 and (groups is None or set(groups).intersection(
                     r.get("acl", {}).get("owners", []) +
                     ([] if owner else r.get("acl", {}).get("viewers", []))))]
+
+    def page(self, payload, *, references=False):
+        from search_backend import BackendError
+        found = [r for r in self.search(payload) if r["id"] in payload["_allowed_ids"]]
+        def value(record, path):
+            obj = record
+            for part in path.split("."):
+                obj = obj.get(part) if isinstance(obj, dict) else None
+            return obj
+        for field, order in reversed(payload["_sort"]):
+            present = [r for r in found if value(r, field) is not None]
+            missing = [r for r in found if value(r, field) is None]
+            found = sorted(present, key=lambda r: value(r, field), reverse=order == "desc") + missing
+        result = {"totalCount": len(found)}
+        if "aggregateBy" in payload:
+            counts = {}
+            for record in found:
+                v = value(record, payload["aggregateBy"])
+                values = v if isinstance(v, list) else ([] if v is None else [v])
+                for key in set(str(v) for v in values):
+                    counts[key] = counts.get(key, 0) + 1
+            if len(counts) > 100:
+                raise BackendError(400, "aggregation_cardinality_limit")
+            result["aggregations"] = [{"key": k, "count": n} for k, n in
+                                      sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        result["results"] = [
+            {"id": r["id"], "version": r["version"],
+             "sort": [value(r, f) for f, _ in payload["_sort"]]} for r in found
+        ] if references else found[payload["offset"]:payload["offset"] + payload["limit"]]
+        return result

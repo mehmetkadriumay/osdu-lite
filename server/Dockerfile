@@ -3,10 +3,16 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r /app/requirements.txt
 COPY server.py /app/server.py
+COPY core_profile.py /app/core_profile.py
+COPY core_auth.py /app/core_auth.py
 COPY reference_services.py /app/reference_services.py
 COPY reference_extensions.py /app/reference_extensions.py
 COPY community_services.py /app/community_services.py
 COPY search_backend.py /app/search_backend.py
+COPY storage_backend.py /app/storage_backend.py
+COPY file_backend.py /app/file_backend.py
+COPY migrate_files.py /app/migrate_files.py
+COPY runtime_jobs.py /app/runtime_jobs.py
 COPY schema_registry.py /app/schema_registry.py
 COPY schemas /app/schemas
 COPY data /app/data

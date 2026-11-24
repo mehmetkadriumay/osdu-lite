@@ -542,7 +542,8 @@ def storage_extension(s, method, suffix, args, query, payload, caller_groups):
                 ref.bad("Cannot purge the latest version")
             if any(entry["pins"] for entry in history if entry["version"] in selected):
                 raise s.CapacityError("pinned_version_capacity")
-            s.RECORD_VERSIONS[rid] = [entry for entry in history if entry["version"] not in selected]
+            with s.storage_transaction():
+                s.RECORD_VERSIONS[rid] = [entry for entry in history if entry["version"] not in selected]
             return 204, None
         obj(payload, {"records"}, {"records", "attributes"} if suffix.endswith("/headers") else {"records"})
         ids = strings(payload["records"], "records", maximum=1000 if suffix.endswith("/headers") else 20)

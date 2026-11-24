@@ -1,526 +1,301 @@
-# OSDU-Lite on two Raspberry Pi 5 nodes
+# OSDU-Lite: two independent 16 GiB Raspberry Pi 5 hosts
 
-This is a minimal, private-LAN demo setup for **two Raspberry Pi 5 boards with
-16 GB RAM each**, using Docker Engine and K3s (lightweight Kubernetes). No Helm,
-container registry account, Java, or locally built image is required.
+**Hardware/performance: NOT VALIDATED.** This is a development runbook, not
+production OSDU, HA, certification, or a measured capacity promise. The current
+source implements the selected core profile; the published upstream `latest`
+image does **not** establish that this uncommitted source has been shipped.
+Use a locally built current image or your own verified image digest.
 
-| Node | Example address | Runs |
+There are exactly three runtime services, no Swarm/Kubernetes, broker, IdP,
+multiwriter coordination, or cross-host Compose network:
+
+| Host (example) | Services / hard memory limits | Storage |
 | --- | --- | --- |
-| `pi1` | `192.168.1.101` | K3s server/control plane and one OSDU-Lite API pod |
-| `pi2` | `192.168.1.102` | K3s agent/worker and one OpenSearch pod |
+| Pi A `192.168.1.101` | one API writer 2 GiB; Azurite 2 GiB | host-local SSD for Azurite snapshots and private files |
+| Pi B `192.168.1.102` | single-node OpenSearch 6 GiB, initial heap 2 GiB | host-local SSD node data |
 
-K3s normally uses containerd. Here, `--docker` makes it use Docker through its
-bundled `cri-dockerd` integration on **both** nodes. Do not also start the Compose
-stack: Kubernetes will manage the application containers.
+Each host has **16 GiB**, not a pooled 16 GiB allocation. Spare RAM on Pi A
+cannot rescue Pi B from OOM. No failover/replica is provided. OpenSearch has one
+primary shard per active kind and zero replicas: four sample kinds use four
+shards; eight is the hard development ceiling, not a Pi recommendation.
 
-**Limitations:** this is not production OSDU or a highly available cluster.
-One control plane and one search node are intentional. Storage, uploaded files,
-and other API state are in memory. An API restart resets its managed search
-index and reloads the 15 sample records. OpenSearch below also uses temporary
-storage; adding a persistent volume would not make the API durable. **Never
-scale the API above one replica** against this shared search index.
+## Prepare and protect both hosts
 
-The instructions are based on the repository's Docker/Compose configuration and
-upstream installation documentation; they have not been hardware-tested on this
-two-Pi setup.
+Use a 64-bit OS (`uname -m` must return `aarch64`), reliable power, active
+cooling, wired private LAN and Docker Engine. Install Docker following its
+[Ubuntu instructions](https://docs.docker.com/engine/install/ubuntu/).
+Verify memory cgroups and local SSD mounts before starting containers.
+Do not put OpenSearch node data on NFS, SMB or other network filesystems.
+Keep backups separate from the live SSD.
 
-## 1. Prepare both Pis
+HTTP, local bearer identities, security-disabled OpenSearch and Azurite's
+**publicly known development account key** are not production security.
+Anyone reaching Azurite with that key can bypass the API's ACL/SAS issuance
+policy. Only trusted operators/clients may reach this setup. Never port-forward
+it to the Internet. Restrict Docker's published ports at the LAN/router and
+Docker forwarding firewall boundaries; do not assume UFW alone protects them.
 
-Use Raspberry Pi Imager to install **Ubuntu Server 24.04 LTS, 64-bit, for
-Raspberry Pi** on each board. This guide assumes fresh installations, not nodes
-already running other clusters or Docker workloads.
-
-- Use reliable power supplies and active cooling.
-- Prefer SSD boot/storage with at least 32 GB free on each Pi; microSD is slower
-  and wears out more quickly.
-- Connect both Pis to the same trusted wired LAN with Internet access.
-- In Imager, enable SSH, configure your own username and SSH key, and set unique
-  hostnames `pi1` and `pi2`.
-- Reserve both addresses in your router's DHCP settings. Replace the example
-  addresses throughout this guide with your actual addresses.
-
-All command blocks below run in **Bash on the named Pi**, over SSH, unless noted
-otherwise. Linux paths in these commands refer to the Pis, not your workstation.
-
-On **each Pi**, connect using the account you configured:
-
-```bash
-# From your workstation; change the address for pi2.
-ssh YOUR_USER@192.168.1.101
-```
-
-Then, on **both Pis**:
-
-```bash
-sudo apt-get update
-sudo apt-get upgrade -y
-sudo apt-get install -y ca-certificates curl git python3
-uname -m
-hostname
-```
-
-`uname -m` must report `aarch64`. Do not use a 32-bit OS. Confirm each hostname
-is correct; if necessary, run `sudo hostnamectl set-hostname pi1` on the first
-Pi and `sudo hostnamectl set-hostname pi2` on the second.
-
-Disable swap for this simple Kubernetes configuration:
-
-```bash
-sudo swapoff -a
-sudo cp -n /etc/fstab /etc/fstab.before-k3s
-sudo sed -i '/^[^#].*[[:space:]]swap[[:space:]]/s/^/#/' /etc/fstab
-sudo reboot
-```
-
-Reconnect after reboot and check on **both Pis**:
-
-```bash
-swapon --show
-grep -w memory /proc/cgroups
-```
-
-`swapon --show` should be empty. If swap returns, disable the service creating
-that swap device before continuing. In `/proc/cgroups`, the `memory` row's last
-column must be `1`; see troubleshooting if it is not.
-
-### Network access
-
-Keep the cluster behind your router; **do not port-forward it to the Internet**.
-If you have host/network firewalls, allow these connections explicitly:
-
-| Traffic | Allowed source and destination |
+| Destination | Permitted sources |
 | --- | --- |
-| TCP 22 | Your administration workstation to both Pis |
-| TCP 6443 | `pi2` to `pi1` for the Kubernetes API |
-| UDP 8472 | Between the two Pis for Flannel VXLAN; never from the Internet |
-| TCP 10250 | Between the two Pis for kubelet/metrics |
-| TCP 30089 | Trusted LAN clients to the Pis for the demo API |
+| Pi A TCP 8089 API | intended trusted clients |
+| Pi A TCP 10000 Blob | intended trusted upload/download clients |
+| Pi B TCP 9200 engine | Pi A only |
+| SSH on both Pis | administration workstation only |
 
-Both nodes need outbound DNS and HTTPS for installation and image downloads.
-The default K3s pod/service ranges are `10.42.0.0/16` and `10.43.0.0/16`; they
-must not overlap your LAN or VPN. Firewalls must also permit pod/service traffic
-on these ranges. Do not assume UFW alone protects Docker or Kubernetes published
-ports; restrict access at your LAN/router boundary too.
+No cluster control-plane, overlay or kubelet ports are needed.
 
-## 2. Install Docker on both Pis
+## Single-host Compose alternative (not two-host deployment)
 
-On **both Pis**, use Docker's convenience installer, suitable for this fresh
-development setup. Download and inspect it before running:
+From `server/`, `docker compose -f compose.yaml up --build -d` builds current
+source and runs all three services on **one host**. Both Compose files retain
+the existing `azurite-data` named volume and add `opensearch-data` persistence.
+Make Docker's volume directory reside on a local SSD. Never use `down -v`
+as a restart/upgrade command: it deletes authoritative snapshots/files.
+
+Default profile is legacy. Azurite publishes `127.0.0.1:10000` and returned
+SAS URLs use `http://localhost:10000/devstoreaccount1`. For trusted LAN clients,
+set `AZURITE_BIND_IP` to the host's LAN address and
+`AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT` to that same client-reachable account
+root; adjust the firewall first. Changing `AZURITE_BLOB_PORT` also requires
+changing the public endpoint's port. The internal SDK endpoint remains
+`http://azurite:10000/devstoreaccount1`, independent of client DNS.
+
+`OSDU_COMPAT_PROFILE=core` selects core; `OPENSEARCH_JAVA_OPTS` can override the
+initial `-Xms2g -Xmx2g`. Hard limits are API 2g, Azurite 2g, OpenSearch 6g.
+The pull configuration accepts `IMAGE`; its default upstream `latest` is only
+a legacy quickstart, **not a release of these changes**. Do not claim current
+core behavior from that default image.
+
+## Two-host standalone Docker placement
+
+These Bash commands are **instructions, not execution evidence**.
+Choose persistent SSD paths and actual LAN addresses first.
+
+On Pi B:
 
 ```bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-less get-docker.sh
-sudo sh get-docker.sh
-sudo systemctl enable --now docker
-sudo docker run --rm hello-world
-sudo docker version
+sudo mkdir -p /srv/osdu/opensearch
+sudo chown 1000:1000 /srv/osdu/opensearch
+sudo docker run -d --name opensearch --restart unless-stopped --memory 6g \
+  --publish 192.168.1.102:9200:9200 \
+  --mount type=bind,src=/srv/osdu/opensearch,dst=/usr/share/opensearch/data \
+  --env discovery.type=single-node \
+  --env DISABLE_INSTALL_DEMO_CONFIG=true --env DISABLE_SECURITY_PLUGIN=true \
+  --env OPENSEARCH_JAVA_OPTS="-Xms2g -Xmx2g" \
+  --env node.store.allow_mmap=false opensearchproject/opensearch:3.9.0
+curl -fsS 'http://192.168.1.102:9200/_cluster/health?wait_for_status=yellow&timeout=30s'
 ```
 
-Press `q` to exit `less`. Continue only if `hello-world` succeeds. Using `sudo`
-avoids adding your user to the root-equivalent Docker group.
-
-## 3. Create the Kubernetes control plane on pi1
-
-On **pi1**:
+On Pi A, build the current checkout (or choose a separately verified ARM64
+image digest). Building may require access to the pinned wheels/registry; do
+not remove TLS verification or package hashes to work around failures.
 
 ```bash
-curl -fsSL https://get.k3s.io -o install-k3s.sh
-less install-k3s.sh
-sudo sh install-k3s.sh server \
-  --docker \
-  --node-name pi1 \
-  --node-ip 192.168.1.101 \
-  --disable traefik \
-  --disable servicelb
-
-sudo k3s kubectl wait --for=condition=Ready node/pi1 --timeout=180s
-sudo k3s kubectl get nodes -o wide
-sudo k3s --version
-sudo cat /var/lib/rancher/k3s/server/node-token
+sudo docker build --platform linux/arm64 -t osdu-lite:core-checkpoint ./server
+IMAGE=osdu-lite:core-checkpoint
+sudo mkdir -p /srv/osdu/azurite
+sudo docker network create osdu-core
+sudo docker run -d --name azurite --network osdu-core \
+  --restart unless-stopped --memory 2g --publish 192.168.1.101:10000:10000 \
+  --mount type=bind,src=/srv/osdu/azurite,dst=/data \
+  mcr.microsoft.com/azure-storage/azurite:3.35.0 \
+  azurite-blob --blobHost 0.0.0.0 --location /data \
+  --disableProductStyleUrl --disableTelemetry
 ```
 
-The default single-server SQLite datastore is sufficient. K3s allows application
-pods on the server node, so no control-plane taint removal is needed.
+Create a private, owner-readable `/srv/osdu/api.env` with an editor, outside
+the repository; restrict permissions (`chmod 600`). It must contain:
 
-Record the exact version from the first line of `k3s --version`, such as
-`vX.Y.Z+k3sN`, and the join token. **Keep the token private**: it grants cluster
-access. Do not commit it or the administrator kubeconfig to the repository.
-
-## 4. Join pi2 as the worker
-
-On **pi2**, enter the exact version and token printed on pi1 when prompted:
-
-```bash
-read -r -p "K3s version from pi1: " K3S_VERSION
-read -r -s -p "Join token from pi1: " K3S_TOKEN
-echo
-export INSTALL_K3S_VERSION="$K3S_VERSION"
-export K3S_URL="https://192.168.1.101:6443"
-export K3S_TOKEN
-
-curl -fsSL https://get.k3s.io -o install-k3s.sh
-less install-k3s.sh
-sh install-k3s.sh agent \
-  --docker \
-  --node-name pi2 \
-  --node-ip 192.168.1.102
-
-unset K3S_TOKEN K3S_VERSION INSTALL_K3S_VERSION K3S_URL
+```text
+OSDU_PARTITION=company-prod
+OSDU_TOKEN=<your-private-local-bearer>
+REQUIRE_AUTH=true
+OSDU_COMPAT_PROFILE=legacy
+PRELOAD_FULL_SAMPLE=true
+OPENSEARCH_URL=http://192.168.1.102:9200
+AZURE_STORAGE_PUBLIC_BLOB_ENDPOINT=http://192.168.1.101:10000/devstoreaccount1
+AZURE_STORAGE_CONNECTION_STRING=<copy the public Azurite development connection string from compose.yaml, retaining BlobEndpoint=http://azurite:10000/devstoreaccount1;>
 ```
 
-The installer requests sudo privileges as needed. Using the same K3s version
-prevents server/agent version drift.
-
-Back on **pi1**:
+The placeholder is not a working credential. Do not paste production account
+keys into these development instructions. `OSDU_TOKEN` replaces the shipped
+demo token; it does not add an IdP.
 
 ```bash
-sudo k3s kubectl wait --for=condition=Ready node/pi2 --timeout=180s
-sudo k3s kubectl get nodes -o wide
-sudo k3s kubectl get nodes \
-  -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+sudo docker run -d --name osdu-api --network osdu-core \
+  --restart unless-stopped --memory 2g --publish 192.168.1.101:8089:8089 \
+  --env-file /srv/osdu/api.env "$IMAGE"
+curl -fsS http://192.168.1.101:8089/info
 ```
 
-Both nodes should be `Ready`, with runtime `docker://...`.
+Do not scale the API. `/health` is liveness; inspect `/info` and actual
+Storage/Search readiness before serving clients. Startup restores authoritative
+metadata and rebuilds derived search, not an overwrite of saved records with
+samples. Lost indices can be rebuilt from the snapshot.
 
-## 5. Deploy OpenSearch on pi2
+### Optional private identity and format1 import mounts
 
-Run this and all remaining Kubernetes commands on **pi1**. The Kubernetes CLI
-is bundled with K3s; a separate `kubectl` installation is not needed.
+An optional `OSDU_IDENTITIES_FILE` contains
+`[{"principal":"alice","token":"<private-token>","groups":["<role-or-data-group>"]}]`.
+For example add `--mount type=bind,src=/srv/osdu/identities.json,dst=/private/identities.json,readonly`
+and `--env OSDU_IDENTITIES_FILE=/private/identities.json` to the API command.
+Use owner-only host permissions; never check the file into Git or show tokens
+in commands/logs. Membership seeds only a new partition/format1 migration;
+format2 membership is authoritative. Existing entitlement admins must add any
+missing core service roles; a profile switch does not reseed grants.
 
-The OpenSearch settings match `server/compose.pull.yaml`: single-node mode,
-security disabled, 512 MB Java heap, and memory-mapped storage disabled. Its
-2 GiB memory limit leaves room for native memory beyond the Java heap. Port 9200
-is **cluster-internal only**, not a NodePort or host port.
+Format1 cannot recover old volatile custom schemas/legal/groups. Export them
+before stopping the old writer. An optional private import JSON
+`{"schemas":[],"legalTags":{},"groups":{}}` uses the PRD's registration/export
+shapes. Mount it read-only similarly and set `OSDU_CORE_IMPORT_FILE` for the
+first new-partition/format1 bootstrap. **It is ignored after format2 exists**;
+unknown/unresolved dependencies fail closed, never silently dropped.
+After bootstrap, stop the new writer before migrating local user files.
 
-```bash
-mkdir -p ~/osdu-lite-rpi
-cd ~/osdu-lite-rpi
+## Offline user-file migration
 
-cat > opensearch.yaml <<'YAML'
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: osdu-lite
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: opensearch
-  namespace: osdu-lite
-spec:
-  selector:
-    app: opensearch
-  ports:
-    - name: http
-      port: 9200
-      targetPort: 9200
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: opensearch
-  namespace: osdu-lite
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: opensearch
-  template:
-    metadata:
-      labels:
-        app: opensearch
-    spec:
-      nodeSelector:
-        kubernetes.io/hostname: pi2
-      securityContext:
-        fsGroup: 1000
-      containers:
-        - name: opensearch
-          image: opensearchproject/opensearch:3.9.0
-          ports:
-            - containerPort: 9200
-          env:
-            - name: discovery.type
-              value: single-node
-            - name: DISABLE_INSTALL_DEMO_CONFIG
-              value: "true"
-            - name: DISABLE_SECURITY_PLUGIN
-              value: "true"
-            - name: OPENSEARCH_JAVA_OPTS
-              value: "-Xms512m -Xmx512m"
-            - name: node.store.allow_mmap
-              value: "false"
-          resources:
-            requests:
-              cpu: 500m
-              memory: 1Gi
-            limits:
-              memory: 2Gi
-          volumeMounts:
-            - name: data
-              mountPath: /usr/share/opensearch/data
-          startupProbe:
-            exec:
-              command:
-                - curl
-                - -fsS
-                - "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s"
-            periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 120
-          readinessProbe:
-            exec:
-              command:
-                - curl
-                - -fsS
-                - "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s"
-            periodSeconds: 10
-            timeoutSeconds: 3
-      volumes:
-        - name: data
-          emptyDir: {}
-YAML
+First stop the sole API writer (`sudo docker stop osdu-api`) and quiesce local
+source-file edits. Snapshot format2 must already exist: this tool **does not
+upgrade format1 or import missing controls**. A proper new-API bootstrap/import
+must happen first (it may stop before readiness on unmigrated file records).
+The format1 backup/format2 commit occurs before those sample readiness checks.
 
-sudo k3s kubectl apply -f opensearch.yaml
-sudo k3s kubectl -n osdu-lite rollout status deployment/opensearch --timeout=600s
+Use an explicit JSON array, never an arbitrary directory scan:
+
+```json
+[
+  {"recordId":"company-prod:dataset--File.Generic:YOUR_ID",
+   "sourcePath":"subdir/original.las",
+   "sha256":"REPLACE_WITH_64_LOWERCASE_HEX_SHA256"}
+]
 ```
 
-Wait for the rollout to succeed before continuing. A single OpenSearch node can
-have **yellow** health because replica shards cannot be assigned; this is normal.
-Disabling mmap matches the repository's development configuration and avoids
-requiring a host-wide `vm.max_map_count` change.
+Record IDs must already exist as supported File.Generic Dataset records.
+Relative paths must remain beneath `FILES_DIR`; traversal, symlinks/reparse
+points, missing sources, conflicting duplicate IDs and hash mismatches fail.
+Decide explicitly which user records/files to migrate; source filenames do not
+grant authority. Unmapped user records are not automatically scanned/imported.
 
-## 6. Deploy the API on pi1
-
-Still in `~/osdu-lite-rpi` on **pi1**:
+With pinned Python dependencies on the operator host:
 
 ```bash
-cat > api.yaml <<'YAML'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: osdu-lite
-  namespace: osdu-lite
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: osdu-lite
-  template:
-    metadata:
-      labels:
-        app: osdu-lite
-    spec:
-      nodeSelector:
-        kubernetes.io/hostname: pi1
-      containers:
-        - name: api
-          image: ghcr.io/mehmetkadriumay/osdu-lite:latest
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 8089
-          env:
-            - name: PORT
-              value: "8089"
-            - name: OSDU_PARTITION
-              value: company-prod
-            - name: OSDU_TOKEN
-              value: demo-token
-            - name: REQUIRE_AUTH
-              value: "true"
-            - name: PRELOAD_FULL_SAMPLE
-              value: "true"
-            - name: INDEX_DELAY_SECONDS
-              value: "0.7"
-            - name: OPENSEARCH_URL
-              value: http://opensearch:9200
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              memory: 512Mi
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 8089
-            periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 60
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8089
-            periodSeconds: 5
-            timeoutSeconds: 3
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: osdu-lite
-  namespace: osdu-lite
-spec:
-  type: NodePort
-  selector:
-    app: osdu-lite
-  ports:
-    - name: http
-      port: 8089
-      targetPort: 8089
-      nodePort: 30089
-YAML
-
-sudo k3s kubectl apply -f api.yaml
-sudo k3s kubectl -n osdu-lite rollout status deployment/osdu-lite --timeout=600s
-sudo k3s kubectl -n osdu-lite get pods -o wide
+export FILES_DIR=/srv/operator-files
+export OSDU_PARTITION=company-prod
+# Supply the host-reachable internal SDK connection via a private environment.
+python server/migrate_files.py --manifest /srv/osdu/files-manifest.json --dry-run
+python server/migrate_files.py --manifest /srv/osdu/files-manifest.json --apply --writer-stopped
 ```
 
-Expect one ready API pod on `pi1` and one ready OpenSearch pod on `pi2`. These
-are the ARM64-capable image names used by the repository's published-image
-quickstart; the API image is in the upstream `mehmetkadriumay` namespace, not
-automatically in your fork's namespace. `latest` is convenient but mutable;
-use an available release tag or image digest when you need repeatability.
+The default is dry-run, which makes no Blob container initialization or writes.
+Apply requires an explicit stopped-writer attestation, validates every entry
+and candidate snapshot before writes, streams bounded staging bytes through the
+installed SDK publication path to create-only deterministic private final keys,
+and verifies bytes/hash (including existing final blobs). It rechecks sources
+before one original-ETag snapshot commit. Original local files, record payloads,
+versions, fences, deletion and control state remain unchanged. Identical retries
+do not save or initialize anything. No OpenSearch/service runtime is needed.
+`FILES_DIR` and packaged data must already exist; missing directories are not
+created by the tool.
 
-There is deliberately no API liveness probe: `/health` includes search health,
-so using it to force restarts during a search outage could destroy in-memory
-API state. Readiness removes the API from service until it is healthy again.
-
-## 7. Check the API and run the existing smoke checks
-
-From **pi1**, or a trusted LAN machine with curl:
+Alternatively run the packaged script with the API container **stopped**, using
+the same image/env-file and only a read-only source/manifest mount:
 
 ```bash
-curl -fsS http://192.168.1.101:30089/health
-
-curl -fsS http://192.168.1.101:30089/api/search/v2/query \
-  -H 'Authorization: Bearer demo-token' \
-  -H 'data-partition-id: company-prod' \
-  -H 'Content-Type: application/json' \
-  --data '{"kind":"osdu:wks:master-data--Well:*","query":"data.FacilityName:\"EAGLE-01\"","limit":10}'
+sudo docker run --rm --network osdu-core --env-file /srv/osdu/api.env \
+  --mount type=bind,src=/srv/operator-files,dst=/operator-files,readonly \
+  --mount type=bind,src=/srv/osdu/files-manifest.json,dst=/private/manifest.json,readonly \
+  --env FILES_DIR=/operator-files "$IMAGE" \
+  python /app/migrate_files.py --manifest /private/manifest.json --dry-run
 ```
 
-Health should report `status: UP` and, on a fresh startup, `storedRecords: 15`.
-The search should return the sample EAGLE-01 well. Your application base URL is
-**`http://192.168.1.101:30089`**, not port 8089 on the host. Kubernetes NodePort
-also normally serves the same API through `192.168.1.102:30089`.
+Replace `--dry-run` with `--apply --writer-stopped` only after inspecting the
+plan. Successful binding commit is atomic; byte upload and metadata are not a
+distributed transaction. A failed commit exposes no new binding and reports
+**possible private orphan keys only**, not URLs/accounts/SAS/tokens. Staging is
+retained even on success and reported separately for later offline inventory.
+Never delete possible orphans until comparing them with the authoritative
+snapshot; do not delete shared containers or guess from filenames. A source
+must stay quiescent: the tool verifies published bytes, not a filesystem lock.
 
-To run the repository's existing checks, on **pi1**:
+## Backups, upgrade and rollback
+
+Export old volatile controls while the old writer still runs, then stop it.
+Take consistent stopped-writer backups of the Azurite SSD/volume, local user
+files, private import/identity configuration and matching old image/source.
+Stop Azurite while copying its volume too; a live directory copy is not a
+consistent backup. Preserve original files and backup checksums.
+
+Startup keeps a verified create-only original-format1 blob backup before the
+single ETag format2 overwrite. No automatic downgrade occurs. Switching
+`OSDU_COMPAT_PROFILE=legacy` is **not rollback**. For rollback: stop writers,
+retain failed-upgrade volumes for diagnosis, restore matching **old image plus
+old volumes/files** together, and rebuild search from restored metadata.
+Restoring an old backup **loses all writes after that backup**. Keep uncertain
+new blobs private, rather than deleting data to force readiness.
+
+## Acceptance and resource evidence still required
+
+The final-source offline-equivalent API image built and ran on WSL ARM64
+(142,554,271 bytes; all12 packaged Python inputs hash-matched current source).
+Real core CRUD/schema-search/private SAS and API/Azurite recreation passed with
+no local-files mount/reseed:18 records and1,048,598 uploaded bytes/hash survived.
+Normal final Dockerfile build failed TLS download; existing hash-checked ARM64
+wheels installed offline without weakening TLS/hashes. This is not a Pi pass.
+CI configuration is checked locally; **CI NOT RUN**. Complete smoke and final
+full-backend regression remain deferred release gates. Actual Pi performance
+is **NOT VALIDATED** because hardware is unavailable.
+
+On an isolated test partition, run legacy before core:
 
 ```bash
-cd ~
-git clone https://github.com/sohaibqasem/osdu-lite.git
-cd osdu-lite
-export OSDU_BASE_URL=http://192.168.1.101:30089
+export OSDU_BASE_URL=http://192.168.1.101:8089
+# Configure the existing smoke tools with the private test bearer/partition.
 bash server/smoke-test.sh
 bash server/reference-smoke-test.sh
 python3 server/community-smoke-test.py
+bash demo-all.sh
+python -m unittest discover -s server/tests -v
+# Set explicit private test connections/URL; never point tests at operator data.
+python -m unittest discover -s server/tests -p test_storage_backend.py -v
+python -m unittest discover -s server/tests -p test_file_backend.py -v
+PYTHONPATH=server:server/tests python -m unittest test_file_migration.RealFileMigrationTests -v
+python -m unittest discover -s server/tests -p test_opensearch_integration.py -v
 ```
 
-If you already cloned the repository, use that checkout instead. These checks
-use Bash, curl, and Python's standard library; no Java, Maven, or local pyproj
-installation is needed. Some checks exercise write/delete lifecycles, so run
-them against this disposable demo, not an instance another person relies on.
+Prior unsupported Dataset-undelete baseline attribution is withdrawn; the
+legacy publication/replay regressions were fixed. Latest whole all-backend
+discovery is432 cases,430 passes,1 failure/1 error,0 skips; both failed cases
+passed in isolation afterward, not a full pass. All3 HTTP smokes/full-sample
+Java demo passed. Narrow owner/import fixes pass2/2; tutorial upload now
+authenticates, but Dataset registration hits a legacy list-payload `.get()`
+error. Complete discovery was not rerun; manifest/recreation remain open.
+See the focused release-verification handoff for exact failures and next actions.
+Verify core CRUD/schema-query/file round trip, API/Azurite recreation without
+reseeding, engine index-loss rebuild, and each running image's `aarch64`/digest.
 
-**Security:** the known demo token is an all-groups token, and HTTP is
-unencrypted. OpenSearch has no authentication. Keep the entire setup on a
-trusted private LAN with no untrusted cluster tenants. This is not a hardened
-or Internet-facing installation.
+For Pi acceptance populate four kinds ×250 IDs ×5 versions (average canonical
+record ≤4 KiB, approximately 20 MiB retained), plus 16 sequential 16 MiB files.
+Run two clients for ten minutes on wired LAN using supported search/page/read
+and 100-record batches; include API restart and engine index-loss recovery.
+Record `docker stats --no-stream`, process RSS, request timings and p95,
+host SSD/media/OS/temperature/throttling, OOM counters and exact images/hashes.
+Pass only with no OOM/steady-state 5xx, API/Azurite RSS ≤1.5 GiB each,
+engine usage ≤5 GiB, p95 GET/query ≤2s, 100-record PUT ≤10s and rebuild ≤120s.
 
-## 8. Day-to-day commands
-
-On **pi1**:
-
-```bash
-# See placement, readiness, and recent application output.
-sudo k3s kubectl -n osdu-lite get pods -o wide
-sudo k3s kubectl -n osdu-lite logs deployment/osdu-lite --tail=80
-sudo k3s kubectl -n osdu-lite logs deployment/opensearch --tail=80
-
-# Reset API state and reload the bundled sample (discards your changes).
-sudo k3s kubectl -n osdu-lite rollout restart deployment/osdu-lite
-sudo k3s kubectl -n osdu-lite rollout status deployment/osdu-lite --timeout=600s
-```
-
-Docker and K3s start automatically after reboot. If both Pis reboot, OpenSearch
-may take longer; the API can fail startup and be retried by Kubernetes until
-search becomes reachable. All API process restarts reset its state.
-
-To pull a newer API image deliberately, run the API restart commands above:
-`imagePullPolicy: Always` checks the registry on container creation. This also
-resets API state. For reproducible deployments, edit `api.yaml` to use your
-chosen release tag/digest and reapply it instead.
-
-To stop only this application, leaving the cluster installed:
-
-```bash
-sudo k3s kubectl -n osdu-lite scale deployment/osdu-lite --replicas=0
-sudo k3s kubectl -n osdu-lite scale deployment/opensearch --replicas=0
-```
-
-To start it again:
-
-```bash
-sudo k3s kubectl -n osdu-lite scale deployment/opensearch --replicas=1
-sudo k3s kubectl -n osdu-lite rollout status deployment/opensearch --timeout=600s
-sudo k3s kubectl -n osdu-lite scale deployment/osdu-lite --replicas=1
-sudo k3s kubectl -n osdu-lite rollout status deployment/osdu-lite --timeout=600s
-```
-
-To remove **only this demo and all its temporary data**:
-
-```bash
-sudo k3s kubectl delete namespace osdu-lite
-```
-
-## Troubleshooting
-
-Run these on **pi1** first:
-
-```bash
-sudo k3s kubectl get nodes -o wide
-sudo k3s kubectl -n osdu-lite get pods -o wide
-sudo k3s kubectl -n osdu-lite get events --sort-by=.metadata.creationTimestamp
-sudo k3s kubectl -n osdu-lite describe pods
-```
-
-| Symptom | Check or fix |
+| Measurement | Result |
 | --- | --- |
-| Node does not join | Confirm the server address, private token, matching K3s versions, and TCP 6443 connectivity. On pi2, inspect `sudo journalctl -u k3s-agent -n 80 --no-pager`. |
-| K3s server fails | On pi1, inspect `sudo journalctl -u k3s -n 80 --no-pager`; check swap and memory cgroups. |
-| Pod stays `Pending` | Check node names are exactly `pi1` and `pi2`, both are Ready, and `describe pods` does not report insufficient resources. Placement is pinned intentionally, so a failed Pi is not automatically replaced by the other. |
-| `ImagePullBackOff` | Check Internet/DNS access, image name, registry availability, and ARM64 support. Inspect pod events for the actual error. |
-| API `CrashLoopBackOff` | Check `sudo k3s kubectl -n osdu-lite logs deployment/osdu-lite --previous`. Confirm OpenSearch is Ready and its Service exists. Cross-node failures usually require checking UDP 8472 and firewall forwarding rules. |
-| OpenSearch `OOMKilled` | Check free memory and competing workloads on pi2. The 2 GiB limit includes heap and native memory; raise it only if necessary. |
-| Search fails after OpenSearch pod replacement | Its `emptyDir` may have been lost. Restart the API to rebuild the sample index; this also discards custom API state. |
-| API works on a Pi but not your workstation | Check the actual LAN address, TCP 30089, VLAN/router isolation, and that the API pod is Ready. Do not expose port 9200 as a workaround. |
+| Actual Pi workload/RSS/latency/thermal/SSD | **NOT VALIDATED — hardware unavailable** |
+| Final physical Python footprint | 13 production/utility paths /8,490 lines;20 test paths /8,354 lines |
+| Whole dirty worktree changes vs HEAD, including earlier work (not feature-only) | 10 production paths +3,869/−496;16 test paths +5,061/−62 |
+| Actual API ARM64 offline-equivalent build/core runtime/Blob recreation | **PASS on WSL ARM64**, not Pi; normal Dockerfile TLS download failed |
+| Complete smoke/full-backend regression | **BLOCKED: last432-case result still1 failure/1 error; narrow2/2 passed; tutorial list-envelope error; manifest not run** |
+| CI execution | **NOT RUN — configuration only** |
 
-If the memory cgroup is disabled, on the **affected Pi** edit
-`/boot/firmware/cmdline.txt` with `sudo nano`. Append
-`cgroup_memory=1 cgroup_enable=memory` to the **existing single line**, without
-removing existing options or introducing a second line. Reboot and check
-`grep -w memory /proc/cgroups` again.
-
-If the published API image is unavailable, you can build the repository image
-directly on **pi1**, where the API is pinned. From your repository checkout:
-
-```bash
-sudo docker build -t osdu-lite:rpi ./server
-sudo k3s kubectl -n osdu-lite patch deployment osdu-lite --type=strategic \
-  -p '{"spec":{"template":{"spec":{"containers":[{"name":"api","image":"osdu-lite:rpi","imagePullPolicy":"Never"}]}}}}'
-sudo k3s kubectl -n osdu-lite rollout status deployment/osdu-lite --timeout=600s
-```
-
-This works because K3s is using that node's Docker engine. Update `api.yaml` to
-the same image and pull policy if you intend to keep using the local build;
-otherwise reapplying the original file restores the published-image settings.
-
-## References
-
-- [Repository runtime settings and limitations](README.md)
-- [Docker Engine installation on Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
-- [K3s requirements and networking](https://docs.k3s.io/installation/requirements)
-- [K3s with Docker as its container runtime](https://docs.k3s.io/advanced#using-docker-as-the-container-runtime)
+Full-snapshot transactions copy retained history/controls and serialize/rewrite
+the whole snapshot; Python dictionaries/strings, rollback copies, encoded JSON
+and SDK buffers can multiply the 128 MiB canonical payload ceiling. Up to 5,000
+lifetime fence IDs and pinned indexing history add memory; reference cursors
+avoid full-source caches but still reserve up to 16 MiB serialized references.
+Eight shards (four for samples) add engine native/heap overhead. These are
+meaningful risks under the 2/2/6 GiB limits, not a load benchmark. Measure them
+on each Pi; do not infer capacity from fake tests or pooled host RAM.

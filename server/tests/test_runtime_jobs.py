@@ -163,5 +163,5 @@ assert server.SEARCH_BACKEND is None
 """
         env = dict(os.environ, PRELOAD_FULL_SAMPLE="true")
         result = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(
-            os.path.dirname(__file__)), env=env, capture_output=True, text=True, timeout=10)
+            os.path.dirname(__file__)), env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -1,4 +1,4 @@
-"""Finite, volatile schema catalog. No network retrieval or runtime startup."""
+"""Finite local schema catalog, exported through the authoritative snapshot."""
 import datetime
 import hashlib
 import json
@@ -120,11 +120,18 @@ def _normalize(payload):
             if type(legacy[key]) is not type(identity[key]) or legacy[key] != identity[key]:
                 raise SchemaError(f"schemaIdentity mismatch: {key}")
     status = payload.get("status", info.get("status", "PUBLISHED"))
-    if status not in ("PUBLISHED", "DEPRECATED"):
-        raise SchemaError("Only PUBLISHED and DEPRECATED statuses supported")
+    if status not in ("DEVELOPMENT", "PUBLISHED", "OBSOLETE", "DEPRECATED"):
+        raise SchemaError("Unsupported schema status")
     if "status" in info and info["status"] != status:
         raise SchemaError("Conflicting status fields")
-    return kind, identity, status
+    return kind, identity, "OBSOLETE" if status == "DEPRECATED" else status
+
+
+def legacy_entry(entry):
+    entry = deepcopy(entry)
+    if entry and entry["status"] == "OBSOLETE":
+        entry["status"] = entry["schemaInfo"]["status"] = "DEPRECATED"
+    return entry
 
 
 def _profile(schema, depth=0, root=True):
@@ -212,6 +219,26 @@ def _merge_declarations(left, right):
                 raise SchemaError("Conflicting reference sibling types")
         else:
             result[key] = value
+    return result
+
+
+def _dependency_documents(uri, documents):
+    """Keep referenced validation documents lossless; mapping expansion merges siblings."""
+    pending, seen, result = [(documents[uri], uri)], set(), {}
+    while pending:
+        schema, current = pending.pop()
+        key = (current, id(schema))
+        if key in seen:
+            continue
+        seen.add(key)
+        result[current] = documents[current]
+        if "$ref" in schema:
+            target, base = _target(schema["$ref"], current, documents)
+            pending.append((target, base))
+        for name in ("properties", "$defs"):
+            pending.extend((child, current) for child in schema.get(name, {}).values())
+        if "items" in schema:
+            pending.append((schema["items"], current))
     return result
 
 
@@ -332,9 +359,150 @@ class SchemaRegistry:
         with self._lock:
             return deepcopy(self._entries.get(kind))
 
-    def register(self, payload, method):
+    def register(self, payload, method, *, core=False):
         with self._lock:
-            return self._install(payload, method)
+            if core:
+                if (not isinstance(payload, dict)
+                        or set(payload) - {"schemaInfo", "schema", "references", "fieldMappings"}
+                        or not {"schemaInfo", "schema"} <= set(payload)):
+                    raise SchemaError("Core schema requires schemaInfo and schema")
+                info = payload["schemaInfo"]
+                if (not isinstance(info, dict) or set(info) != {"schemaIdentity", "status"}
+                        or info["status"] not in ("DEVELOPMENT", "PUBLISHED", "OBSOLETE")):
+                    raise SchemaError("Core schema requires identity and canonical status")
+                kind, _, status = _normalize(payload)
+                old = self._entries.get(kind)
+                if kind in self._builtins or (old and method == "POST"):
+                    raise SchemaError("Schema already exists or is read-only", 409)
+                if old is None and status != "DEVELOPMENT":
+                    raise SchemaError("New core schemas must be DEVELOPMENT")
+                if old and old["status"] == "DEVELOPMENT":
+                    # Rebuild detached so edits revalidate dependants and recompile every mapping.
+                    if len(_json_bytes(payload)) > 128 * 1024:
+                        raise SchemaError("Registration exceeds 128 KiB")
+                    updated = deepcopy(old)
+                    for key, default in (("schema", None), ("references", []), ("fieldMappings", {})):
+                        updated[key] = deepcopy(payload.get(key, default))
+                    updated["status"] = updated["schemaInfo"]["status"] = status
+                    entries = [updated if e["kind"] == kind else e for e in self.export_custom()]
+                    candidate = SchemaRegistry(self._catalog_dir)
+                    candidate.import_custom(entries)
+                    for existing_kind, existing in self._entries.items():
+                        if existing["status"] == "DEVELOPMENT":
+                            continue
+                        uri = URN + existing_kind
+                        before = _dependency_documents(uri, self._documents)
+                        after = _dependency_documents(uri, candidate._documents)
+                        if _json_bytes(before) != _json_bytes(after):
+                            raise SchemaError("Published schema dependencies are immutable", 409)
+                    for name in ("_entries", "_documents", "_fields", "_validators", "_builtins"):
+                        setattr(self, name, getattr(candidate, name))
+                    return 200, self.get(kind)["schemaInfo"]
+                code, entry = self._install(payload, method)
+                return (201 if old is None else code), entry["schemaInfo"]
+            code, entry = self._install(payload, method)
+            return code, legacy_entry(entry)
+
+    def list_core(self, params):
+        identity_keys = set(IDENTITY_KEYS)
+        allowed = identity_keys | {"status", "scope", "latestVersion", "offset", "limit"}
+        if set(params) - allowed:
+            raise SchemaError("Unknown schema filter")
+        status, scope = params.get("status", "PUBLISHED"), params.get("scope", "INTERNAL")
+        if status not in ("DEVELOPMENT", "PUBLISHED", "OBSOLETE") or scope not in ("INTERNAL", "SHARED"):
+            raise SchemaError("Invalid status or scope")
+        latest = params.get("latestVersion", "false")
+        if latest not in ("true", "false"):
+            raise SchemaError("latestVersion must be true or false")
+        numbers = {}
+        for key in ("offset", "limit", *IDENTITY_KEYS[3:]):
+            value = params.get(key, "20" if key == "limit" else "0")
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+                raise SchemaError("Invalid numeric schema parameter")
+            numbers[key] = int(value)
+        if numbers["limit"] > 100 or any(not params[key] for key in IDENTITY_KEYS[:3] if key in params):
+            raise SchemaError("Invalid schema parameter")
+        with self._lock:
+            entries = []
+            for kind, entry in self._entries.items():
+                entry_scope = "SHARED" if kind in self._builtins else "INTERNAL"
+                identity = entry["schemaInfo"]["schemaIdentity"]
+                if entry["status"] != status or entry_scope != scope:
+                    continue
+                if any(identity[k] != (numbers[k] if k in numbers else params[k])
+                       for k in identity_keys if k in params):
+                    continue
+                entries.append((kind, entry, entry_scope))
+            if latest == "true":
+                groups = {}
+                for item in entries:
+                    identity = item[1]["schemaInfo"]["schemaIdentity"]
+                    group = tuple(identity[k] for k in IDENTITY_KEYS[:3])
+                    version = tuple(identity[k] for k in IDENTITY_KEYS[3:])
+                    if group not in groups or version > groups[group][0]:
+                        groups[group] = (version, item)
+                entries = [value[1] for value in groups.values()]
+            entries.sort(key=lambda item: item[0])
+            total = len(entries)
+            page = entries[numbers["offset"]:numbers["offset"] + numbers["limit"]]
+            infos = [{**deepcopy(entry["schemaInfo"]), "scope": entry_scope}
+                     for _, entry, entry_scope in page]
+            return {"schemaInfos": infos, "count": len(infos), "totalCount": total,
+                    "offset": numbers["offset"] + len(infos)}
+
+    def export_custom(self):
+        with self._lock:
+            return [deepcopy(entry) for kind, entry in self._entries.items() if kind not in self._builtins]
+
+    def import_custom(self, entries):
+        """Validate into a detached registry, then replace the complete custom catalog."""
+        if not isinstance(entries, list) or len(entries) > 28:
+            raise SchemaError("Invalid custom schema catalog")
+        candidate = SchemaRegistry(self._catalog_dir)
+        pending = deepcopy(entries)
+        seen = set(candidate._builtins)
+        for entry in pending:
+            kind, _, _ = _normalize(entry)
+            if kind in seen:
+                raise SchemaError("Duplicate or built-in custom schema")
+            seen.add(kind)
+        # Exports may refer to a custom kind exported later in the list.
+        while pending:
+            remaining = []
+            failure = None
+            for entry in pending:
+                try:
+                    kind, _, status = _normalize(entry)
+                    registration = {"kind": kind, "schema": entry["schema"]}
+                    for key in ("references", "fieldMappings"):
+                        if entry.get(key):
+                            registration[key] = entry[key]
+                    if status != "PUBLISHED":
+                        registration["status"] = status
+                    candidate.register(registration, "POST")
+                    # Preserve original audit metadata, never trust compiled validators/mappings.
+                    installed = candidate._entries[kind]
+                    for key in ("createdAt", "createdBy"):
+                        if key in entry:
+                            if not isinstance(entry[key], str):
+                                raise SchemaError("Invalid schema audit metadata")
+                            installed[key] = entry[key]
+                    for key in ("created", "createdBy"):
+                        if key in entry.get("schemaInfo", {}):
+                            value = entry["schemaInfo"][key]
+                            if not isinstance(value, str):
+                                raise SchemaError("Invalid schema audit metadata")
+                            installed["schemaInfo"][key] = value
+                except SchemaError as exc:
+                    failure = exc
+                    remaining.append(entry)
+            if len(remaining) == len(pending):
+                raise SchemaError("Invalid custom schema dependencies") from failure
+            pending = remaining
+        candidate._check_bytes(candidate._entries, candidate._documents)
+        with self._lock:
+            for name in ("_entries", "_documents", "_fields", "_validators", "_builtins"):
+                setattr(self, name, getattr(candidate, name))
 
     def _check_bytes(self, entries, documents):
         if len(_json_bytes({"entries": entries, "documents": documents})) > 2 * 1024 * 1024:
@@ -360,7 +528,7 @@ class SchemaRegistry:
             if _json_bytes(content) != _json_bytes(old_content):
                 raise SchemaError("Published schema content is immutable", 409)
             if status != old["status"]:
-                if kind in self._builtins or method != "PUT" or old["status"] == "DEPRECATED":
+                if kind in self._builtins or method != "PUT" or old["status"] == "OBSOLETE" or status != "OBSOLETE":
                     raise SchemaError("Schema lifecycle transition forbidden", 409)
                 updated = deepcopy(old)
                 updated["status"] = updated["schemaInfo"]["status"] = status
@@ -417,7 +585,7 @@ class SchemaRegistry:
             self._builtins.add(kind)
         return (201 if method == "POST" else 200), deepcopy(response)
 
-    def validate_record(self, record):
+    def validate_record(self, record, *, allow_inactive=False):
         with self._lock:
             if not isinstance(record, dict):
                 raise SchemaError("Record must be an object")
@@ -430,8 +598,8 @@ class SchemaRegistry:
             kind = record["kind"]
             if kind not in self._entries:
                 raise SchemaError("Unsupported kind: " + kind)
-            if self._entries[kind]["status"] == "DEPRECATED":
-                raise SchemaError("Schema is DEPRECATED: " + kind, 409)
+            if not allow_inactive and self._entries[kind]["status"] != "PUBLISHED":
+                raise SchemaError("Schema is not PUBLISHED: " + kind, 409)
             acl = record.get("acl")
             if not isinstance(acl, dict):
                 raise SchemaError("/acl: object required")
@@ -496,4 +664,14 @@ class SchemaRegistry:
                 if leaf["type"] == "keyword":
                     leaf["fields"] = {"text": {"type": "text"}}
                 current["properties"][parts[-1]] = leaf
+            # Fixed policy/audit envelope, never inferred from submitted data.
+            mapping["properties"].update({
+                "_deleted": {"type": "boolean"},
+                "createUser": {"type": "keyword"}, "modifyUser": {"type": "keyword"},
+                "createTime": {"type": "date"}, "modifyTime": {"type": "date"},
+                "legal": {"type": "object", "dynamic": False, "properties": {
+                    "legaltags": {"type": "keyword"},
+                    "otherRelevantDataCountries": {"type": "keyword"}}}})
+            mapping["properties"].setdefault("data", {
+                "type": "object", "dynamic": False, "properties": {}})
             return mapping

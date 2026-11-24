@@ -22,6 +22,8 @@ class Job:
     payload: object
     deadline: float = float("inf")
     terminal: object = None
+    started: object = None
+    fence: object = None
     attempts: int = field(default=0, init=False)
 
 
@@ -60,7 +62,7 @@ class Reservation:
 
 class Scheduler:
     def __init__(self, index_execute, delivery_execute=None, *, clock=time.monotonic,
-                 index_capacity=1000, delivery_capacity=1000):
+                 index_capacity=1000, delivery_capacity=1000, sweep=None):
         self.execute = {"index": index_execute, "delivery": delivery_execute}
         self.capacity = {"index": index_capacity, "delivery": delivery_capacity}
         self.used = dict.fromkeys(self.capacity, 0)
@@ -73,6 +75,7 @@ class Scheduler:
         self.threads = []
         self.reservations = set()
         self.closed = False
+        self.sweep = sweep
 
     def pending(self, lane):
         with self.condition:
@@ -120,6 +123,8 @@ class Scheduler:
         else:
             job.attempts += 1
             try:
+                if job.started:
+                    job.started()
                 outcome = self.execute[lane](job)
                 if not isinstance(outcome, Outcome):
                     raise TypeError("executor must return Outcome")
@@ -159,6 +164,40 @@ class Scheduler:
                     if not self.closed:
                         self.condition.wait(.05)
 
+    def sweep_deadlines(self):
+        if self.sweep:
+            self.sweep()
+        expired = []
+        with self.condition:
+            for lane, queue in self.queues.items():
+                retained = []
+                for entry in queue:
+                    _, sequence, job = entry
+                    if self.clock() >= job.deadline:
+                        self.used[lane] -= 1
+                        order = self.order[lane][job.key]
+                        order.remove(sequence)
+                        if not order:
+                            del self.order[lane][job.key]
+                        expired.append(job)
+                    else:
+                        retained.append(entry)
+                queue[:] = retained
+                heapq.heapify(queue)
+            self.condition.notify_all()
+        for job in expired:
+            self._notify(job, Outcome(False, False, "deadline"))
+
+    def _sweeper(self):
+        while True:
+            with self.condition:
+                if self.closed:
+                    return
+                self.condition.wait(.05)
+                if self.closed:
+                    return
+            self.sweep_deadlines()
+
     def start(self):
         with self.condition:
             if self.closed:
@@ -172,6 +211,9 @@ class Scheduler:
                                                   name=f"osdu-{lane}-{number}", daemon=True)
                         self.threads.append(thread)
                         thread.start()
+            thread = threading.Thread(target=self._sweeper, name="osdu-deadlines", daemon=True)
+            self.threads.append(thread)
+            thread.start()
 
     def stop(self, timeout=10):
         deadline = time.monotonic() + min(max(timeout, 0), 10)

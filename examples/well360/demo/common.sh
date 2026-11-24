@@ -54,15 +54,29 @@ register_demo_dataset() {
 
   local upload_url
   upload_url="$(printf '%s' "$instructions" | python3 -c 'import json,sys; print(json.load(sys.stdin)["storageLocation"]["signedUrl"])')"
+  if [[ "$upload_url" != "${BASE%/}/upload/"* ]]; then
+    echo "Expected same-API legacy upload URL; refusing to forward bearer credentials." >&2
+    return 1
+  fi
 
   echo "== upload synthetic LAS =="
-  curl -fsS -X PUT "$upload_url" \
+  curl -fsS "${AUTH[@]}" -X PUT "$upload_url" \
     -H "x-file-name: eagle01_gr_cali.las" \
     --data-binary "@$ROOT/demo/eagle01_gr_cali.las" \
     | python3 -m json.tool
 
   echo "== register Dataset record =="
+  local file_source
+  file_source="$(printf '%s' "$instructions" | python3 -c 'import json,sys; print(json.load(sys.stdin)["storageLocation"]["FileSource"])')"
   osdu_json -X PUT "$BASE/api/dataset/v1/registerDataset" \
-    --data-binary "@$ROOT/samples/sample_dataset_record.json" \
+    --data "$(python3 - "$ROOT/samples/sample_dataset_record.json" "$file_source" <<'PY'
+import json,sys
+with open(sys.argv[1]) as source:
+    records = json.load(source)
+for record in records:
+    record["data"]["FileSource"] = sys.argv[2]
+print(json.dumps({"datasetRegistries": records}))
+PY
+)" \
     | python3 -m json.tool
 }

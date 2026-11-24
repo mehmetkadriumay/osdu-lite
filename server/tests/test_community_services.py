@@ -494,7 +494,9 @@ class CommunityAcceptance(ServerTestCase):
         check("workflow", "POST /v1/workflow/system", {"workflowName": "demo-system",
               "description": "local mock", "registrationInstructions": {"dagName": {"value": "no-execution"}}},
               status=200, fields=("workflowName",))
-        run = call("post", "/api/workflow/v1/workflow/Osdu_ingest/workflowRun", {"executionContext": {}})[1]
+        # Executable ingestion requires a nonempty, fully validated manifest.
+        run = call("post", "/api/workflow/v1/workflow/Osdu_ingest/workflowRun", {
+            "executionContext": {"manifest": {"MasterData": [record]}}})[1]
         run_id = run.get("workflowRunId") or run["runId"]
         check("workflow", "GET /v1/workflow/{workflow_name}/workflowRun/{runId}/latestInfo",
               path="/v1/workflow/Osdu_ingest/workflowRun/" + run_id + "/latestInfo", fields=("runId", "status"))
